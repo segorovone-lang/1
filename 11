@@ -1,8 +1,8 @@
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
-import java.util.TreeSet;
-import java.util.stream.Collectors;
+import java.util.Set;
 
 public record DateRangeDto(LocalDate startDate, LocalDate endDate) {}
 
@@ -12,77 +12,66 @@ public class DateRangeProcessor {
         LocalDate mainStart = rateArrangementDateRange.startDate();
         LocalDate mainEnd = rateArrangementDateRange.endDate();
 
-        TreeSet<LocalDate> boundaries = new TreeSet<>();
-        boundaries.add(mainStart);
+        // Защита от некорректного входного диапазона
+        if (mainStart == null) {
+            return List.of();
+        }
+
+        Set<LocalDate> cutPoints = new HashSet<>();
+        cutPoints.add(mainStart);
 
         if (segmentRateRanges != null) {
-            for (var segment : segmentRateRanges) {
-                processSegment(mainStart, mainEnd, segment, boundaries);
+            for (DateRangeDto seg : segmentRateRanges) {
+                // Безопасное получение дат сегмента
+                LocalDate segStart = seg.startDate() != null ? seg.startDate() : mainStart;
+                LocalDate segEnd = seg.endDate();
+
+                // 1. Находим начало пересечения
+                LocalDate overlapStart = segStart.isBefore(mainStart) ? mainStart : segStart;
+
+                // 2. Находим конец пересечения (учитываем null как бесконечность)
+                LocalDate overlapEnd;
+                if (mainEnd == null) {
+                    overlapEnd = segEnd;
+                } else if (segEnd == null) {
+                    overlapEnd = mainEnd;
+                } else {
+                    overlapEnd = segEnd.isBefore(mainEnd) ? segEnd : mainEnd;
+                }
+
+                // 3. Проверяем, есть ли реальное пересечение
+                boolean hasOverlap = (overlapEnd == null) || !overlapStart.isAfter(overlapEnd);
+                if (!hasOverlap) {
+                    continue;
+                }
+
+                // 4. Добавляем точки разрыва
+                cutPoints.add(overlapStart);
+                if (overlapEnd != null) {
+                    cutPoints.add(overlapEnd.plusDays(1));
+                }
             }
         }
 
-        // Оставляем только точки, попадающие в основной диапазон
-        List<LocalDate> points = boundaries.stream()
-                .filter(d -> !d.isBefore(mainStart) && (mainEnd == null || !d.isAfter(mainEnd)))
-                .collect(Collectors.toList());
+        // 5. Фильтруем, оставляем только точки внутри основного диапазона, и сортируем
+        List<LocalDate> sortedPoints = cutPoints.stream()
+                .filter(p -> !p.isBefore(mainStart))
+                .filter(p -> mainEnd == null || !p.isAfter(mainEnd))
+                .sorted()
+                .toList();
 
+        // 6. Формируем итоговые интервалы
         List<DateRangeDto> result = new ArrayList<>();
-        for (int i = 0; i < points.size(); i++) {
-            LocalDate start = points.get(i);
-            LocalDate end = (i < points.size() - 1) ? points.get(i + 1).minusDays(1) : mainEnd;
+        for (int i = 0; i < sortedPoints.size(); i++) {
+            LocalDate start = sortedPoints.get(i);
+            LocalDate end = (i < sortedPoints.size() - 1) ? sortedPoints.get(i + 1).minusDays(1) : mainEnd;
 
-            // 🔒 ИСПРАВЛЕНИЕ: безопасная проверка для null (бесконечность)
+            // 🔒 Финальная защита от некорректных интервалов (start > end)
             if (end == null || !start.isAfter(end)) {
                 result.add(new DateRangeDto(start, end));
             }
         }
 
         return result;
-    }
-
-    private void processSegment(LocalDate mainStart, LocalDate mainEnd, 
-                                DateRangeDto segment, TreeSet<LocalDate> boundaries) {
-        LocalDate segStart = segment.startDate();
-        LocalDate segEnd = segment.endDate();
-
-        LocalDate overlapStart = segStart.isBefore(mainStart) ? mainStart : segStart;
-
-        LocalDate overlapEnd;
-        if (mainEnd == null) {
-            overlapEnd = segEnd;
-        } else if (segEnd == null) {
-            overlapEnd = mainEnd;
-        } else {
-            overlapEnd = segEnd.isBefore(mainEnd) ? segEnd : mainEnd;
-        }
-
-        // 🔒 ИСПРАВЛЕНИЕ: проверка overlapEnd на null перед isAfter
-        if (overlapEnd != null && overlapStart.isAfter(overlapEnd)) {
-            return; // Пересечения нет
-        }
-
-        boundaries.add(overlapStart);
-        
-        // Добавляем следующий день только если конец пересечения конечный
-        if (overlapEnd != null) {
-            boundaries.add(overlapEnd.plusDays(1));
-        }
-    }
-
-    public static void main(String[] args) {
-        DateRangeProcessor processor = new DateRangeProcessor();
-
-        var mainRange = new DateRangeDto(LocalDate.of(2026, 5, 20), null);
-        var segments = List.of(
-            new DateRangeDto(LocalDate.of(2026, 4, 4), null),
-            new DateRangeDto(LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31)),
-            new DateRangeDto(LocalDate.of(2026, 5, 21), null)
-        );
-
-        var result = processor.exchangeIntervals(mainRange, segments);
-
-        System.out.println("Итоговые интервалы:");
-        result.forEach(r -> System.out.printf("с %s по %s%n", 
-            r.startDate(), r.endDate() == null ? "null (бесконечность)" : r.endDate()));
     }
 }
