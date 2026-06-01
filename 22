@@ -2,59 +2,63 @@ import java.time.LocalDate;
 import java.util.*;
 
 public record DateRangeDto(LocalDate startDate, LocalDate endDate) {
-    // endDate = null означает бесконечность (открытый интервал)
+    public DateRangeDto {
+        Objects.requireNonNull(startDate, "startDate must not be null");
+        // endDate может быть null (бесконечность)
+    }
 }
 
 public class IntervalExchangeService {
 
     /**
-     * Разбивает основной диапазон {@code rateArrangementDateRange} на интервалы,
-     * границы которых определяются началами и окончаниями переданных сегментов {@code segmentRateRanges}.
-     * Сегменты, выходящие за пределы основного диапазона, обрезаются.
+     * Разбивает основной диапазон {@code rateArrangementDateRange} на интервалы
+     * с учётом начал и окончаний переданных сегментов {@code segmentRateRanges}.
      *
-     * @param rateArrangementDateRange основной диапазон (startDate включительно, endDate может быть null)
-     * @param segmentRateRanges        список сегментов, которые не могут начинаться до и заканчиваться после основного
-     * @return список непересекающихся интервалов, покрывающих основной диапазон, с границами,
-     *         соответствующими начальным точкам сегментов и следующим дням за их окончаниями
+     * @param rateArrangementDateRange основной диапазон (не null)
+     * @param segmentRateRanges        список сегментов (не null, не содержит null-элементов)
+     * @return список непересекающихся интервалов, покрывающих основной диапазон
+     * @throws NullPointerException если любой из параметров null или список содержит null
      */
     public List<DateRangeDto> exchangeIntervals(DateRangeDto rateArrangementDateRange,
                                                  List<DateRangeDto> segmentRateRanges) {
+        Objects.requireNonNull(rateArrangementDateRange, "rateArrangementDateRange must not be null");
+        Objects.requireNonNull(segmentRateRanges, "segmentRateRanges must not be null");
+
         LocalDate mainStart = rateArrangementDateRange.startDate();
         LocalDate mainEnd = rateArrangementDateRange.endDate(); // может быть null
 
-        // Точки разбиения основного диапазона (всегда включаем начало)
         NavigableSet<LocalDate> splitPoints = new TreeSet<>();
         splitPoints.add(mainStart);
 
         for (DateRangeDto seg : segmentRateRanges) {
-            // Обрезаем сегмент по границам основного диапазона
+            Objects.requireNonNull(seg, "segmentRateRanges contains null element");
+
             LocalDate segStart = seg.startDate();
             LocalDate segEnd = seg.endDate();
 
-            // Корректируем начало: оно не может быть раньше mainStart
+            // Корректируем начало: не раньше основного старта
             if (segStart.isBefore(mainStart)) {
                 segStart = mainStart;
             }
 
-            // Корректируем конец: если mainEnd задан и segEnd == null или больше mainEnd
+            // Корректируем конец: если mainEnd задан, а segEnd выходит за границу
             if (mainEnd != null) {
                 if (segEnd == null || segEnd.isAfter(mainEnd)) {
                     segEnd = mainEnd;
                 }
             }
 
-            // Если после коррекции сегмент вырожден (начало > конец) — игнорируем
+            // Игнорируем вырожденный сегмент
             if (segEnd != null && segStart.isAfter(segEnd)) {
                 continue;
             }
 
-            // Добавляем начало сегмента как точку разбиения, если оно строго внутри основного
+            // Точка разбиения: начало сегмента (если внутри)
             if (segStart.isAfter(mainStart)) {
                 splitPoints.add(segStart);
             }
 
-            // Добавляем следующий день после окончания сегмента, если окончание задано
-            // и эта точка находится внутри основного диапазона (или основной диапазон бесконечен)
+            // Точка разбиения: день после окончания (если окончание есть и точка внутри)
             if (segEnd != null) {
                 LocalDate dayAfterEnd = segEnd.plusDays(1);
                 if (mainEnd == null || !dayAfterEnd.isAfter(mainEnd)) {
@@ -63,7 +67,7 @@ public class IntervalExchangeService {
             }
         }
 
-        // Формируем интервалы по отсортированным точкам разбиения
+        // Формируем интервалы
         List<LocalDate> points = new ArrayList<>(splitPoints);
         List<DateRangeDto> result = new ArrayList<>();
 
@@ -72,14 +76,12 @@ public class IntervalExchangeService {
             LocalDate intervalEnd;
 
             if (i < points.size() - 1) {
-                // Интервал длится до дня, предшествующего следующей точке разбиения
                 intervalEnd = points.get(i + 1).minusDays(1);
             } else {
-                // Последний интервал: конец совпадает с концом основного диапазона (может быть null)
-                intervalEnd = mainEnd;
+                intervalEnd = mainEnd; // может быть null
             }
 
-            // Исключаем вырожденные интервалы (начало > конец) – в корректных входных данных не возникнут
+            // Пропускаем вырожденные интервалы (start > end)
             if (intervalEnd != null && intervalStart.isAfter(intervalEnd)) {
                 continue;
             }
@@ -88,22 +90,5 @@ public class IntervalExchangeService {
         }
 
         return result;
-    }
-
-    // Пример использования
-    public static void main(String[] args) {
-        IntervalExchangeService service = new IntervalExchangeService();
-
-        DateRangeDto main = new DateRangeDto(LocalDate.of(2026, 5, 20), null);
-        List<DateRangeDto> segments = List.of(
-                new DateRangeDto(LocalDate.of(2026, 4, 4), null),
-                new DateRangeDto(LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31)),
-                new DateRangeDto(LocalDate.of(2026, 5, 21), null)
-        );
-
-        List<DateRangeDto> result = service.exchangeIntervals(main, segments);
-        result.forEach(r -> System.out.println(
-                "с " + r.startDate() + " по " + (r.endDate() == null ? "null" : r.endDate())
-        ));
     }
 }
