@@ -8,16 +8,10 @@ public record DateRangeDto(LocalDate startDate, LocalDate endDate) {}
 
 public class DateRangeProcessor {
 
-    /**
-     * Разбивает основной диапазон на части, учитывая пересечения с сегментами.
-     * Если основной диапазон пересекается с сегментами, он "разрезается" по их границам.
-     * null в endDate означает бесконечность.
-     */
     public List<DateRangeDto> exchangeIntervals(DateRangeDto rateArrangementDateRange, List<DateRangeDto> segmentRateRanges) {
         LocalDate mainStart = rateArrangementDateRange.startDate();
         LocalDate mainEnd = rateArrangementDateRange.endDate();
 
-        // TreeSet автоматически сортирует даты и убирает дубликаты
         TreeSet<LocalDate> boundaries = new TreeSet<>();
         boundaries.add(mainStart);
 
@@ -27,7 +21,7 @@ public class DateRangeProcessor {
             }
         }
 
-        // Оставляем только точки-начала интервалов, которые попадают в основной диапазон
+        // Оставляем только точки, попадающие в основной диапазон
         List<LocalDate> points = boundaries.stream()
                 .filter(d -> !d.isBefore(mainStart) && (mainEnd == null || !d.isAfter(mainEnd)))
                 .collect(Collectors.toList());
@@ -35,12 +29,10 @@ public class DateRangeProcessor {
         List<DateRangeDto> result = new ArrayList<>();
         for (int i = 0; i < points.size(); i++) {
             LocalDate start = points.get(i);
-            // Конец текущего интервала = начало следующего - 1 день, 
-            // либо конец основного диапазона (для последнего элемента)
             LocalDate end = (i < points.size() - 1) ? points.get(i + 1).minusDays(1) : mainEnd;
 
-            // Защита от вырожденных интервалов (start > end)
-            if (!start.isAfter(end)) {
+            // 🔒 ИСПРАВЛЕНИЕ: безопасная проверка для null (бесконечность)
+            if (end == null || !start.isAfter(end)) {
                 result.add(new DateRangeDto(start, end));
             }
         }
@@ -53,10 +45,8 @@ public class DateRangeProcessor {
         LocalDate segStart = segment.startDate();
         LocalDate segEnd = segment.endDate();
 
-        // 1. Находим начало пересечения
         LocalDate overlapStart = segStart.isBefore(mainStart) ? mainStart : segStart;
 
-        // 2. Находим конец пересечения
         LocalDate overlapEnd;
         if (mainEnd == null) {
             overlapEnd = segEnd;
@@ -66,20 +56,19 @@ public class DateRangeProcessor {
             overlapEnd = segEnd.isBefore(mainEnd) ? segEnd : mainEnd;
         }
 
-        // 3. Если пересечения нет, пропускаем сегмент
-        if (overlapStart.isAfter(overlapEnd)) {
-            return;
+        // 🔒 ИСПРАВЛЕНИЕ: проверка overlapEnd на null перед isAfter
+        if (overlapEnd != null && overlapStart.isAfter(overlapEnd)) {
+            return; // Пересечения нет
         }
 
-        // 4. Добавляем границы пересечения в набор точек разбиения
         boundaries.add(overlapStart);
+        
+        // Добавляем следующий день только если конец пересечения конечный
         if (overlapEnd != null) {
-            // Следующий день после конца пересечения становится началом нового интервала
             boundaries.add(overlapEnd.plusDays(1));
         }
     }
 
-    // Пример использования, точно соответствующий вашему условию
     public static void main(String[] args) {
         DateRangeProcessor processor = new DateRangeProcessor();
 
