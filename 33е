@@ -1,0 +1,116 @@
+import org.junit.jupiter.api.Test;
+import java.time.LocalDate;
+import java.util.List;
+import static org.junit.jupiter.api.Assertions.*;
+
+class DateRangeProcessorTest {
+
+    private final DateRangeProcessor processor = new DateRangeProcessor();
+
+    @Test
+    void testPromptExample() {
+        var main = new DateRangeDto(LocalDate.of(2026, 5, 20), null);
+        var segments = List.of(
+            new DateRangeDto(LocalDate.of(2026, 4, 4), null),
+            new DateRangeDto(LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31)),
+            new DateRangeDto(LocalDate.of(2026, 5, 21), null)
+        );
+
+        var expected = List.of(
+            new DateRangeDto(LocalDate.of(2026, 5, 20), LocalDate.of(2026, 5, 20)),
+            new DateRangeDto(LocalDate.of(2026, 5, 21), LocalDate.of(2026, 5, 31)),
+            new DateRangeDto(LocalDate.of(2026, 6, 1), null)
+        );
+
+        assertEquals(expected, processor.exchangeIntervals(main, segments));
+    }
+
+    @Test
+    void testNoSegments() {
+        var main = new DateRangeDto(LocalDate.of(2026, 1, 1), LocalDate.of(2026, 1, 31));
+        var result = processor.exchangeIntervals(main, null);
+        assertEquals(1, result.size());
+        assertEquals(main.startDate(), result.get(0).startDate());
+        assertEquals(main.endDate(), result.get(0).endDate());
+    }
+
+    @Test
+    void testSegmentsFullyInsideMain() {
+        var main = new DateRangeDto(LocalDate.of(2026, 1, 1), LocalDate.of(2026, 1, 31));
+        var segments = List.of(
+            new DateRangeDto(LocalDate.of(2026, 1, 10), LocalDate.of(2026, 1, 20))
+        );
+        var result = processor.exchangeIntervals(main, segments);
+        
+        assertEquals(2, result.size());
+        assertEquals(LocalDate.of(2026, 1, 1), result.get(0).startDate());
+        assertEquals(LocalDate.of(2026, 1, 9), result.get(0).endDate());
+        assertEquals(LocalDate.of(2026, 1, 21), result.get(1).startDate());
+        assertEquals(LocalDate.of(2026, 1, 31), result.get(1).endDate());
+    }
+
+    @Test
+    void testOverlappingSegments_MergingBoundaries() {
+        // Сегменты пересекаются друг с другом, алгоритм должен корректно объединить точки разрыва
+        var main = new DateRangeDto(LocalDate.of(2026, 1, 1), null);
+        var segments = List.of(
+            new DateRangeDto(LocalDate.of(2026, 1, 5), LocalDate.of(2026, 1, 10)),
+            new DateRangeDto(LocalDate.of(2026, 1, 8), LocalDate.of(2026, 1, 15))
+        );
+        var result = processor.exchangeIntervals(main, segments);
+
+        // Ожидается: [1-4], [5-15], [16-null]
+        assertEquals(3, result.size());
+        assertEquals(LocalDate.of(2026, 1, 5), result.get(1).startDate());
+        assertEquals(LocalDate.of(2026, 1, 15), result.get(1).endDate());
+    }
+
+    @Test
+    void testSegmentEndsExactlyAtMainEnd() {
+        var main = new DateRangeDto(LocalDate.of(2026, 3, 1), LocalDate.of(2026, 3, 31));
+        var segments = List.of(
+            new DateRangeDto(LocalDate.of(2026, 3, 20), LocalDate.of(2026, 3, 31))
+        );
+        var result = processor.exchangeIntervals(main, segments);
+        
+        assertEquals(2, result.size());
+        assertEquals(LocalDate.of(2026, 3, 1), result.get(0).startDate());
+        assertEquals(LocalDate.of(2026, 3, 19), result.get(0).endDate());
+        assertEquals(LocalDate.of(2026, 3, 20), result.get(1).startDate());
+        assertEquals(LocalDate.of(2026, 3, 31), result.get(1).endDate());
+    }
+
+    @Test
+    void testNullEndInSegmentInsideFiniteMain() {
+        var main = new DateRangeDto(LocalDate.of(2026, 6, 1), LocalDate.of(2026, 6, 30));
+        var segments = List.of(
+            new DateRangeDto(LocalDate.of(2026, 6, 10), null) // сегмент "до бесконечности"
+        );
+        var result = processor.exchangeIntervals(main, segments);
+
+        assertEquals(2, result.size());
+        assertEquals(LocalDate.of(2026, 6, 1), result.get(0).startDate());
+        assertEquals(LocalDate.of(2026, 6, 9), result.get(0).endDate());
+        assertEquals(LocalDate.of(2026, 6, 10), result.get(1).startDate());
+        assertEquals(LocalDate.of(2026, 6, 30), result.get(1).endDate()); // обрезано по mainEnd
+    }
+
+    @Test
+    void testEmptySegmentsList() {
+        var main = new DateRangeDto(LocalDate.of(2026, 12, 1), LocalDate.of(2026, 12, 31));
+        var result = processor.exchangeIntervals(main, List.of());
+        assertEquals(1, result.size());
+        assertEquals(main, result.get(0));
+    }
+
+    @Test
+    void testMainStartEqualsMainEnd() {
+        var main = new DateRangeDto(LocalDate.of(2026, 7, 15), LocalDate.of(2026, 7, 15));
+        var segments = List.of(
+            new DateRangeDto(LocalDate.of(2026, 7, 10), LocalDate.of(2026, 7, 20))
+        );
+        var result = processor.exchangeIntervals(main, segments);
+        // Главный день полностью перекрыт сегментом -> интервалов не остается
+        assertTrue(result.isEmpty());
+    }
+}
