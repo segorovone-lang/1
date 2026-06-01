@@ -1,0 +1,109 @@
+import java.time.LocalDate;
+import java.util.*;
+
+public record DateRangeDto(LocalDate startDate, LocalDate endDate) {
+    // endDate = null означает бесконечность (открытый интервал)
+}
+
+public class IntervalExchangeService {
+
+    /**
+     * Разбивает основной диапазон {@code rateArrangementDateRange} на интервалы,
+     * границы которых определяются началами и окончаниями переданных сегментов {@code segmentRateRanges}.
+     * Сегменты, выходящие за пределы основного диапазона, обрезаются.
+     *
+     * @param rateArrangementDateRange основной диапазон (startDate включительно, endDate может быть null)
+     * @param segmentRateRanges        список сегментов, которые не могут начинаться до и заканчиваться после основного
+     * @return список непересекающихся интервалов, покрывающих основной диапазон, с границами,
+     *         соответствующими начальным точкам сегментов и следующим дням за их окончаниями
+     */
+    public List<DateRangeDto> exchangeIntervals(DateRangeDto rateArrangementDateRange,
+                                                 List<DateRangeDto> segmentRateRanges) {
+        LocalDate mainStart = rateArrangementDateRange.startDate();
+        LocalDate mainEnd = rateArrangementDateRange.endDate(); // может быть null
+
+        // Точки разбиения основного диапазона (всегда включаем начало)
+        NavigableSet<LocalDate> splitPoints = new TreeSet<>();
+        splitPoints.add(mainStart);
+
+        for (DateRangeDto seg : segmentRateRanges) {
+            // Обрезаем сегмент по границам основного диапазона
+            LocalDate segStart = seg.startDate();
+            LocalDate segEnd = seg.endDate();
+
+            // Корректируем начало: оно не может быть раньше mainStart
+            if (segStart.isBefore(mainStart)) {
+                segStart = mainStart;
+            }
+
+            // Корректируем конец: если mainEnd задан и segEnd == null или больше mainEnd
+            if (mainEnd != null) {
+                if (segEnd == null || segEnd.isAfter(mainEnd)) {
+                    segEnd = mainEnd;
+                }
+            }
+
+            // Если после коррекции сегмент вырожден (начало > конец) — игнорируем
+            if (segEnd != null && segStart.isAfter(segEnd)) {
+                continue;
+            }
+
+            // Добавляем начало сегмента как точку разбиения, если оно строго внутри основного
+            if (segStart.isAfter(mainStart)) {
+                splitPoints.add(segStart);
+            }
+
+            // Добавляем следующий день после окончания сегмента, если окончание задано
+            // и эта точка находится внутри основного диапазона (или основной диапазон бесконечен)
+            if (segEnd != null) {
+                LocalDate dayAfterEnd = segEnd.plusDays(1);
+                if (mainEnd == null || !dayAfterEnd.isAfter(mainEnd)) {
+                    splitPoints.add(dayAfterEnd);
+                }
+            }
+        }
+
+        // Формируем интервалы по отсортированным точкам разбиения
+        List<LocalDate> points = new ArrayList<>(splitPoints);
+        List<DateRangeDto> result = new ArrayList<>();
+
+        for (int i = 0; i < points.size(); i++) {
+            LocalDate intervalStart = points.get(i);
+            LocalDate intervalEnd;
+
+            if (i < points.size() - 1) {
+                // Интервал длится до дня, предшествующего следующей точке разбиения
+                intervalEnd = points.get(i + 1).minusDays(1);
+            } else {
+                // Последний интервал: конец совпадает с концом основного диапазона (может быть null)
+                intervalEnd = mainEnd;
+            }
+
+            // Исключаем вырожденные интервалы (начало > конец) – в корректных входных данных не возникнут
+            if (intervalEnd != null && intervalStart.isAfter(intervalEnd)) {
+                continue;
+            }
+
+            result.add(new DateRangeDto(intervalStart, intervalEnd));
+        }
+
+        return result;
+    }
+
+    // Пример использования
+    public static void main(String[] args) {
+        IntervalExchangeService service = new IntervalExchangeService();
+
+        DateRangeDto main = new DateRangeDto(LocalDate.of(2026, 5, 20), null);
+        List<DateRangeDto> segments = List.of(
+                new DateRangeDto(LocalDate.of(2026, 4, 4), null),
+                new DateRangeDto(LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31)),
+                new DateRangeDto(LocalDate.of(2026, 5, 21), null)
+        );
+
+        List<DateRangeDto> result = service.exchangeIntervals(main, segments);
+        result.forEach(r -> System.out.println(
+                "с " + r.startDate() + " по " + (r.endDate() == null ? "null" : r.endDate())
+        ));
+    }
+}
