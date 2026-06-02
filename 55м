@@ -1,0 +1,155 @@
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.util.*;
+
+public record DateRangeDto(LocalDate startDate, LocalDate endDate) {
+    public DateRangeDto {
+        Objects.requireNonNull(startDate, "startDate must not be null");
+    }
+}
+
+public class IntervalExchangeService {
+
+    /**
+     * Разбивает основной период на интервалы, учитывая приоритет сегментов.
+     * Сегмент с более поздней датой начала имеет более высокий приоритет.
+     * Если интервал сегмента начинается не с 1-го числа и выходит за пределы
+     * месяца начала, он разбивается по концу этого месяца.
+     *
+     * @param main  основной диапазон (не null, startDate обязательно, endDate может быть null)
+     * @param segments список сегментов (не null, без null-элементов)
+     * @return хронологически упорядоченный список непересекающихся интервалов
+     * @throws NullPointerException если параметры или элементы списка null
+     */
+    public List<DateRangeDto> exchangeIntervals(DateRangeDto main,
+                                                 List<DateRangeDto> segments) {
+        Objects.requireNonNull(main, "rateArrangementDateRange must not be null");
+        Objects.requireNonNull(segments, "segmentRateRanges must not be null");
+
+        LocalDate mainStart = main.startDate();
+        LocalDate mainEnd = main.endDate(); // null = бесконечность
+
+        // 1. Обрезаем все сегменты по границам основного диапазона
+        List<DateRangeDto> clipped = new ArrayList<>();
+        for (DateRangeDto seg : segments) {
+            Objects.requireNonNull(seg, "segmentRateRanges contains null element");
+
+            LocalDate s = seg.startDate();
+            LocalDate e = seg.endDate();
+
+            if (s.isBefore(mainStart)) s = mainStart;
+            if (mainEnd != null) {
+                if (e == null || e.isAfter(mainEnd)) e = mainEnd;
+            }
+            if (e != null && s.isAfter(e)) continue; // вырожденный пропускаем
+            clipped.add(new DateRangeDto(s, e));
+        }
+
+        // 2. Сортируем по началу (раньше -> позже), при равенстве – по концу (null считаем максимумом)
+        clipped.sort(Comparator.comparing(DateRangeDto::startDate)
+                .thenComparing(DateRangeDto::endDate, Comparator.nullsLast(Comparator.naturalOrder())));
+
+        // 3. Занятые интервалы (инициализируем пустым списком)
+        List<DateRangeDto> occupied = new ArrayList<>();
+        List<DateRangeDto> result = new ArrayList<>();
+
+        // 4. Обрабатываем сегменты от наиболее приоритетного (конец списка) к наименее
+        for (int i = clipped.size() - 1; i >= 0; i--) {
+            DateRangeDto seg = clipped.get(i);
+            List<DateRangeDto> parts = subtractInterval(seg, occupied);
+
+            for (DateRangeDto part : parts) {
+                // Применяем правило разбиения по месяцу начала
+                result.addAll(splitByMonthStart(part));
+            }
+            occupied.addAll(result); // все новые интервалы становятся занятыми
+        }
+
+        // Сортируем итоговый список по началу
+        result.sort(Comparator.comparing(DateRangeDto::startDate));
+        return result;
+    }
+
+    // Вычитание списка занятых интервалов из одного интервала
+    private List<DateRangeDto> subtractInterval(DateRangeDto source, List<DateRangeDto> occupied) {
+        List<DateRangeDto> remaining = new ArrayList<>();
+        remaining.add(source);
+
+        for (DateRangeDto occ : occupied) {
+            List<DateRangeDto> newRemaining = new ArrayList<>();
+            for (DateRangeDto r : remaining) {
+                newRemaining.addAll(subtractSingle(r, occ));
+            }
+            remaining = newRemaining;
+            if (remaining.isEmpty()) break;
+        }
+        return remaining;
+    }
+
+    private List<DateRangeDto> subtractSingle(DateRangeDto a, DateRangeDto b) {
+        // a минус b
+        List<DateRangeDto> result = new ArrayList<>();
+        LocalDate a1 = a.startDate();
+        LocalDate a2 = a.endDate();
+        LocalDate b1 = b.startDate();
+        LocalDate b2 = b.endDate();
+
+        // b полностью перекрывает a
+        if (b1.compareTo(a1) <= 0 && (b2 == null || (a2 != null && b2.compareTo(a2) >= 0))) {
+            return result; // пусто
+        }
+
+        // b не пересекается с a
+        if (b2 != null && b2.compareTo(a1) < 0 || (a2 != null && b1.compareTo(a2) > 0)) {
+            result.add(a);
+            return result;
+        }
+
+        // Левая часть
+        if (b1.compareTo(a1) > 0) {
+            LocalDate leftEnd = b1.minusDays(1);
+            if (leftEnd.compareTo(a1) >= 0) {
+                result.add(new DateRangeDto(a1, leftEnd));
+            }
+        }
+
+        // Правая часть
+        if (b2 != null && (a2 == null || b2.compareTo(a2) < 0)) {
+            LocalDate rightStart = b2.plusDays(1);
+            if (a2 == null || rightStart.compareTo(a2) <= 0) {
+                result.add(new DateRangeDto(rightStart, a2));
+            }
+        } else if (b2 == null && a2 != null) {
+            // b бесконечный, но a2 конечен -> правая часть отсутствует
+        }
+
+        return result;
+    }
+
+    // Разбиение интервала, если он начинается не с 1-го числа и выходит за пределы месяца начала
+    private List<DateRangeDto> splitByMonthStart(DateRangeDto interval) {
+        List<DateRangeDto> result = new ArrayList<>();
+        LocalDate start = interval.startDate();
+        LocalDate end = interval.endDate();
+
+        // Если начало – первое число месяца, или интервал не выходит за месяц, не разбиваем
+        if (start.getDayOfMonth() == 1 || (end != null && YearMonth.from(start).equals(YearMonth.from(end)))) {
+            result.add(interval);
+            return result;
+        }
+
+        YearMonth startMonth = YearMonth.from(start);
+        LocalDate endOfMonth = startMonth.atEndOfMonth();
+
+        // Первая часть: [start, endOfMonth]
+        result.add(new DateRangeDto(start, endOfMonth));
+
+        // Вторая часть: [1-е число следующего месяца, end] (если не пусто)
+        LocalDate nextMonthStart = startMonth.plusMonths(1).atDay(1);
+        if (end == null || !nextMonthStart.isAfter(end)) {
+            result.add(new DateRangeDto(nextMonthStart, end));
+        }
+
+        return result;
+    }
+}
