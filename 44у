@@ -1,0 +1,56 @@
+   @Test
+    @DisplayName("Пример из условия: основной диапазон 20.05.2026-∞, сегменты, ожидаемый результат")
+    void exampleFromCondition() {
+        DateRangeDto main = new DateRangeDto(LocalDate.of(2026, 5, 20), null);
+        List<DateRangeDto> segments = List.of(
+                new DateRangeDto(LocalDate.of(2026, 4, 4), null),
+                new DateRangeDto(LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31)),
+                new DateRangeDto(LocalDate.of(2026, 5, 21), null)
+        );
+
+        List<DateRangeDto> result = service.exchangeIntervals(main, segments);
+
+        assertEquals(3, result.size());
+        assertEquals(new DateRangeDto(LocalDate.of(2026, 5, 20), LocalDate.of(2026, 5, 20)), result.get(0));
+        assertEquals(new DateRangeDto(LocalDate.of(2026, 5, 21), LocalDate.of(2026, 5, 31)), result.get(1));
+        assertEquals(new DateRangeDto(LocalDate.of(2026, 6, 1), null), result.get(2));
+    }
+
+    @Test
+    @DisplayName("Пустой список сегментов возвращает один интервал, равный основному")
+    void emptySegments() {
+        DateRangeDto main = new DateRangeDto(LocalDate.of(2026, 1, 1), LocalDate.of(2026, 12, 31));
+        List<DateRangeDto> result = service.exchangeIntervals(main, List.of());
+        assertEquals(1, result.size());
+        assertEquals(main, result.get(0));
+    }
+
+    @Test
+    @DisplayName("Основной диапазон с конечной датой, сегмент полностью перекрывает")
+    void finiteMainSegmentsOutside() {
+        DateRangeDto main = new DateRangeDto(LocalDate.of(2026, 5, 20), LocalDate.of(2026, 6, 10));
+        List<DateRangeDto> segments = List.of(
+                new DateRangeDto(LocalDate.of(2026, 4, 1), null) // обрежется до границ
+        );
+        List<DateRangeDto> result = service.exchangeIntervals(main, segments);
+        // Ожидаем один интервал, так как сегмент покрывает весь основной диапазон,
+        // но начало сегмента раньше main.start -> корректируем, конец null, но mainEnd ограничен -> segEnd = mainEnd.
+        // Разбиение: добавляется mainStart и dayAfterEnd (mainEnd+1) не добавляется, т.к. mainEnd задан и dayAfterEnd=mainEnd+1 > mainEnd.
+        // splitPoints = {2026-05-20}. Интервал один: 2026-05-20..2026-06-10.
+        assertEquals(1, result.size());
+        assertEquals(new DateRangeDto(LocalDate.of(2026, 5, 20), LocalDate.of(2026, 6, 10)), result.get(0));
+    }
+
+    @Test
+    @DisplayName("Сегменты с null-окончанием не создают лишних точек разбиения после себя")
+    void segmentWithNullEnd() {
+        DateRangeDto main = new DateRangeDto(LocalDate.of(2026, 5, 1), null);
+        List<DateRangeDto> segments = List.of(
+                new DateRangeDto(LocalDate.of(2026, 5, 10), null) // начало внутри основного
+        );
+        List<DateRangeDto> result = service.exchangeIntervals(main, segments);
+        // splitPoints: mainStart (2026-05-01), segStart (2026-05-10). Итог: два интервала.
+        assertEquals(2, result.size());
+        assertEquals(new DateRangeDto(LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 9)), result.get(0));
+        assertEquals(new DateRangeDto(LocalDate.of(2026, 5, 10), null), result.get(1));
+    }
