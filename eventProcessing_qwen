@@ -1,0 +1,121 @@
+package com.example.processor.service;
+
+import com.example.processor.entity.ProductEvent;
+import com.example.processor.repository.ProductEventRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class EventProcessingService {
+
+    private final ProductEventRepository eventRepository;
+    private final RedissonClient redissonClient;
+    private final ExecutorService eventProcessingExecutor;
+
+    private static final int BATCH_SIZE = 200;
+    private static final int LOCK_LEASE_TIME_SECONDS = 30; // Защита от deadlocks при падении пода в K8s
+
+    /**
+     * Запускается каждые 2 секунды. 
+     * Если событий нет, метод быстро завершается, не нагружая систему.
+     */
+    @Scheduled(fixedDelay = 2000)
+    public void processEventsBatch() {
+        // 1. Получаем доступные события (те, что не заблокированы другими транзакциями БД)
+        List<ProductEvent> batch = eventRepository.findNextAvailableBatch();
+        
+        if (batch.isEmpty()) {
+            return; // Нечего обрабатывать, ждем следующего тика
+        }
+
+        log.debug("Получена пачка из {} событий", batch.size());
+
+        // 2. Группируем события по экземпляру продукта в памяти
+        // Это гарантирует, что мы попытаемся обработать все доступные события одного экземпляра за один раз
+        Map<Long, List<ProductEvent>> groupedByInstance = batch.stream()
+                .collect(Collectors.groupingBy(ProductEvent::getProductInstanceId));
+
+        // 3. Создаем CompletableFuture для каждой группы
+        List<CompletableFuture<Void>> futures = groupedByInstance.values().stream()
+                .map(eventsForInstance -> CompletableFuture.runAsync(() -> {
+                    Long instanceId = eventsForInstance.get(0).getProductInstanceId();
+                    String lockKey = "lock:product_instance:" + instanceId;
+                    RLock lock = redissonClient.getLock(lockKey);
+
+                    try {
+                        // Пытаемся захватить лок. 
+                        // waitTime = 0: если лок занят другим подом/потоком, мы НЕ ждем, а сразу идем дальше.
+                        // leaseTime = 30: если под умрет (OOMKilled), лок автоматически исчезнет через 30 сек.
+                        boolean isLocked = lock.tryLock(0, LOCK_LEASE_TIME_SECONDS, TimeUnit.SECONDS);
+
+                        if (isLocked) {
+                            try {
+                                log.info("Начало обработки экземпляра {}. Событий в пачке: {}", instanceId, eventsForInstance.size());
+                                
+                                // === БИЗНЕС-ЛОГИКА ЗДЕСЬ ===
+                                processInstanceEvents(eventsForInstance);
+                                
+                                // Помечаем как обработанные только после успешного выполнения
+                                List<Long> processedIds = eventsForInstance.stream().map(ProductEvent::getId).toList();
+                                eventRepository.markAsProcessed(processedIds);
+                                
+                                log.info("Успешно обработан экземпляр {}", instanceId);
+                            } finally {
+                                // Снимаем лок только если он всё еще принадлежит нам
+                                if (lock.isHeldByCurrentThread()) {
+                                    lock.unlock();
+                                }
+                            }
+                        } else {
+                            // Эвенты этого экземпляра пропускаем в этой итерации.
+                            // Они останутся в БД и будут подхвачены в следующем цикле (через 2 сек), 
+                            // когда лок освободится. Это естественный throttle (ограничитель).
+                            log.debug("Экземпляр {} заблокирован другим воркером, пропускаем в этой итерации", instanceId);
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        log.error("Поток прерван при попытке получить лок для экземпляра {}", instanceId, e);
+                    } catch (Exception e) {
+                        log.error("Необработанная ошибка при обработке экземпляра {}", instanceId, e);
+                    }
+                }, eventProcessingExecutor))
+                .collect(Collectors.toList());
+
+        // 4. Ждем завершения обработки всей пачки, чтобы не начать новую, пока не закончена текущая
+        // (можно убрать .join(), если допустимо наложение тиков планировщика, но с fixedDelay это и так безопасно)
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } catch (Exception e) {
+            log.error("Ошибка при ожидании завершения асинхронных задач", e);
+        }
+    }
+
+    private void processInstanceEvents(List<ProductEvent> events) {
+        // ВАЖНО: Эта логика должна быть идемпотентной.
+        // Если метод будет вызван дважды для одних и тех же данных, состояние системы не должно испортиться.
+        for (ProductEvent event : events) {
+            // Имитация обработки
+            // log.debug("Обработка события {} для экземпляра {}", event.getId(), event.getProductInstanceId());
+        }
+        
+        // Имитация задержки (например, вызов внешнего API)
+        try {
+            Thread.sleep(50); 
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
