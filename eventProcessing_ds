@@ -1,0 +1,164 @@
+package com.example.processor.service;
+
+import com.example.processor.entity.ProductEvent;
+import com.example.processor.repository.ProductEventRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RBucket;
+import org.redisson.api.RScript;
+import org.redisson.api.RedissonClient;
+import org.redisson.client.RedisException;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class EventProcessingService {
+
+    private final ProductEventRepository eventRepository;
+    private final ProcessedEventRegistry processedEventRegistry;
+    private final RedissonClient redissonClient;
+    private final TransactionTemplate transactionTemplate;
+
+    // Исполнители для CPU и БД задач
+    private final ExecutorService cpuExecutor = Executors.newWorkStealingPool();
+    private final ExecutorService dbExecutor = Executors.newFixedThreadPool(20);
+    // Планировщик продления блокировок
+    private final ScheduledExecutorService lockRenewalScheduler =
+            Executors.newScheduledThreadPool(4);
+
+    // Семафор ограничения параллелизма на поде
+    private final Semaphore semaphore = new Semaphore(50);
+
+    // Lua‑скрипты
+    private static final String SAFE_UNLOCK_SCRIPT =
+            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+            "return redis.call('del', KEYS[1]) " +
+            "else return 0 end";
+
+    private static final String RENEW_SCRIPT =
+            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+            "return redis.call('expire', KEYS[1], ARGV[2]) " +
+            "else return 0 end";
+
+    @Scheduled(fixedDelay = 2000)
+    public void processEventsBatch() {
+        List<ProductEvent> batch = eventRepository.findNextAvailableBatch(); // SKIP LOCKED
+        if (batch.isEmpty()) return;
+
+        Map<Long, List<ProductEvent>> grouped = batch.stream()
+                .collect(Collectors.groupingBy(ProductEvent::getProductInstanceId));
+
+        for (List<ProductEvent> eventsForInstance : grouped.values()) {
+            try {
+                semaphore.acquire();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+
+            Long instanceId = eventsForInstance.get(0).getProductInstanceId();
+            String lockKey = "lock:product_instance:" + instanceId;
+            String lockValue = UUID.randomUUID().toString();
+
+            boolean lockAcquired = acquireLock(lockKey, lockValue);
+            if (!lockAcquired) {
+                semaphore.release();
+                continue;
+            }
+
+            ScheduledFuture<?> renewalFuture = startLockRenewal(lockKey, lockValue);
+
+            CompletableFuture
+                    .supplyAsync(() -> {
+                        log.info("[CPU] Фильтрация для экземпляра {}", instanceId);
+                        return filterAndPrepareEvents(eventsForInstance);
+                    }, cpuExecutor)
+                    .thenComposeAsync(preparedEvents -> {
+                        log.info("[DB] Запись для экземпляра {}", instanceId);
+                        return saveToDatabaseAsync(preparedEvents);
+                    }, dbExecutor)
+                    .whenCompleteAsync((result, error) -> {
+                        // ГАРАНТИРОВАННОЕ ОСВОБОЖДЕНИЕ РЕСУРСОВ
+                        try {
+                            renewalFuture.cancel(false);
+                            safeUnlock(lockKey, lockValue);
+                        } finally {
+                            semaphore.release();
+                        }
+
+                        if (error != null) {
+                            log.error("[ERROR] Ошибка обработки экземпляра {}", instanceId, error);
+                        } else {
+                            log.info("[SUCCESS] Экземпляр {} обработан", instanceId);
+                        }
+                    }, dbExecutor);
+        }
+    }
+
+    private boolean acquireLock(String lockKey, String lockValue) {
+        try {
+            RBucket<String> bucket = redissonClient.getBucket(lockKey);
+            return bucket.setIfAbsent(lockValue, Duration.ofSeconds(30));
+        } catch (RedisException e) {
+            log.warn("Redis недоступен при захвате блокировки {}", lockKey, e);
+            return true; // fallback без блокировки
+        }
+    }
+
+    private ScheduledFuture<?> startLockRenewal(String lockKey, String lockValue) {
+        return lockRenewalScheduler.scheduleAtFixedRate(() -> {
+            try {
+                redissonClient.getScript().eval(
+                        RScript.Mode.READ_WRITE,
+                        RENEW_SCRIPT,
+                        RScript.ReturnType.INTEGER,
+                        Collections.singletonList(lockKey),
+                        lockValue, 30
+                );
+            } catch (Exception e) {
+                log.error("Ошибка продления блокировки {}", lockKey, e);
+            }
+        }, 10, 10, TimeUnit.SECONDS);
+    }
+
+    private void safeUnlock(String lockKey, String lockValue) {
+        try {
+            redissonClient.getScript().eval(
+                    RScript.Mode.READ_WRITE,
+                    SAFE_UNLOCK_SCRIPT,
+                    RScript.ReturnType.INTEGER,
+                    Collections.singletonList(lockKey),
+                    lockValue
+            );
+        } catch (Exception e) {
+            log.error("Ошибка при освобождении блокировки {}", lockKey, e);
+        }
+    }
+
+    private List<ProductEvent> filterAndPrepareEvents(List<ProductEvent> events) {
+        List<Long> ids = events.stream().map(ProductEvent::getId).toList();
+        List<Long> already = processedEventRegistry.findAlreadyProcessedIds(ids);
+        return events.stream()
+                .filter(e -> !already.contains(e.getId()))
+                .collect(Collectors.toList());
+    }
+
+    private CompletableFuture<Void> saveToDatabaseAsync(List<ProductEvent> events) {
+        if (events.isEmpty()) return CompletableFuture.completedFuture(null);
+        return CompletableFuture.runAsync(() -> {
+            transactionTemplate.executeWithoutResult(status -> {
+                List<Long> ids = events.stream().map(ProductEvent::getId).toList();
+                processedEventRegistry.registerProcessedEvents(events);
+                eventRepository.markAsProcessed(ids);
+            });
+        }, dbExecutor);
+    }
+}
