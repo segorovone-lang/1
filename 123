@@ -1,0 +1,44 @@
+    /**
+     * Обрабатывает список диапазонов дат:
+     * 1. Заполняет отсутствующие endDate значением «startDate следующего элемента – 1 день».
+     * 2. Объединяет смежные диапазоны, у которых endDate текущего == startDate следующего.
+     *
+     * @param ranges исходный список (ожидается сортировка по startDate)
+     * @return новый список с заполненными и объединёнными диапазонами
+     */
+    public static List<DateRangeDto> mergeRanges(List<DateRangeDto> ranges) {
+        // ---------- Шаг 1: заполняем пустые endDate ----------
+        List<DateRangeDto> filled = new ArrayList<>();
+        for (int i = 0; i < ranges.size(); i++) {
+            DateRangeDto curr = ranges.get(i);
+            LocalDate start = curr.startDate();
+            LocalDate end = curr.endDate();
+
+            if (end == null && i + 1 < ranges.size()) {
+                // следующий элемент существует – берём его startDate - 1 день
+                end = ranges.get(i + 1).startDate().minusDays(1);
+            }
+            filled.add(new DateRangeDto(start, end));
+        }
+
+        // ---------- Шаг 2: объединяем стыкующиеся диапазоны ----------
+        List<DateRangeDto> merged = new ArrayList<>();
+        if (filled.isEmpty()) {
+            return merged;
+        }
+
+        DateRangeDto current = filled.get(0);
+        for (int i = 1; i < filled.size(); i++) {
+            DateRangeDto next = filled.get(i);
+            // Если конец текущего не null и равен началу следующего – склеиваем
+            if (current.endDate() != null && current.endDate().equals(next.startDate())) {
+                // новый диапазон: начало от current, конец от next (может быть null)
+                current = new DateRangeDto(current.startDate(), next.endDate());
+            } else {
+                merged.add(current);
+                current = next;
+            }
+        }
+        merged.add(current);
+        return merged;
+    }
