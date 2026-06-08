@@ -1,0 +1,64 @@
+--liquibase formatted sql
+
+--changeset your_name:create_task_index_procedure
+CREATE OR REPLACE PROCEDURE build_and_attach_task_indexes()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    part_record RECORD;
+    parent_idx TEXT := 'idx_tasks_priority_oper_req_id';
+    part_idx TEXT;
+    current_schema_name TEXT;
+BEGIN
+    -- Get current schema to ensure we check the right namespace
+    SELECT nspname INTO current_schema_name FROM pg_namespace WHERE oid = pg_my_temp_schema() OR nspname = current_schema();
+
+    -- 1. Create parent index shell. 
+    -- 'ON ONLY' prevents PostgreSQL from trying to synchronously build it on all partitions.
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON ONLY tasks (priority, oper_date, request_id, id)', parent_idx);
+
+    -- 2. Iterate over all partitions of the 'tasks' table
+    FOR part_record IN 
+        SELECT c.relname AS part_name
+        FROM pg_inherits i
+        JOIN pg_class c ON i.inhrelid = c.oid
+        JOIN pg_class p ON i.inhparent = p.oid
+        WHERE p.relname = 'tasks'
+    LOOP
+        part_idx := parent_idx || '_' || part_record.part_name;
+
+        -- 3. Create index CONCURRENTLY on the partition (if it doesn't already exist)
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class 
+            WHERE relname = part_idx 
+              AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema_name)
+        ) THEN
+            RAISE NOTICE 'Creating concurrent index on partition: %', part_record.part_name;
+            EXECUTE format(
+                'CREATE INDEX CONCURRENTLY %I ON %I (priority, oper_date, request_id, id)', 
+                part_idx, 
+                part_record.part_name
+            );
+        ELSE
+            RAISE NOTICE 'Index % already exists, skipping creation.', part_idx;
+                END IF;
+
+        -- 4. Attach the partition index to the parent index (if not already attached)
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_inherits i
+            JOIN pg_class c ON i.inhrelid = c.oid      -- child (partition index)
+            JOIN pg_class p ON i.inhparent = p.oid     -- parent (main index)
+            WHERE p.relname = parent_idx AND c.relname = part_idx
+        ) THEN
+            RAISE NOTICE 'Attaching index % to parent %', part_idx, parent_idx;
+            EXECUTE format('ALTER INDEX %I ATTACH PARTITION %I', parent_idx, part_idx);
+        ELSE
+            RAISE NOTICE 'Index % is already attached to parent.', part_idx;
+        END IF;
+    END LOOP;
+    
+    RAISE NOTICE 'Index creation and attachment completed successfully.';
+END;
+$$;
+
+--rollback DROP PROCEDURE IF EXISTS build_and_attach_task_indexes();
