@@ -1,0 +1,133 @@
+package com.example.rates.service;
+
+import com.example.rates.model.Allowance;
+import com.example.rates.model.Rate;
+import com.example.rates.model.TariffOption;
+import com.example.rates.repository.AllowanceRepository;
+import com.example.rates.repository.RateRepository;
+
+import java.time.LocalDate;
+import java.util.*;
+
+public class RateSplitter {
+
+    private final RateRepository rateRepo;
+    private final AllowanceRepository allowanceRepo;
+
+    public RateSplitter(RateRepository rateRepo, AllowanceRepository allowanceRepo) {
+        this.rateRepo = rateRepo;
+        this.allowanceRepo = allowanceRepo;
+    }
+
+    /**
+     * Базовое разбиение одной записи в точке splitPoint.
+     * UPDATE endDate у существующей + INSERT новой записи.
+     */
+    public void splitAt(LocalDate splitPoint) {
+        Optional<Rate> found = rateRepo.findCovering(splitPoint);
+        if (found.isEmpty()) return;
+
+        Rate rate = found.get();
+        if (rate.getBeginDate().equals(splitPoint)) return;
+        if (splitPoint.isBefore(rate.getBeginDate()) || splitPoint.isAfter(rate.getEndDate())) {
+            return;
+        }
+
+        LocalDate originalEnd = rate.getEndDate();
+        rate.setEndDate(splitPoint.minusDays(1));
+        rateRepo.save(new Rate(null, splitPoint, originalEnd));
+    }
+
+    /**
+     * Применяет TariffOption:
+     * 1. Гарантирует непрерывное покрытие периода [beginDate, endDate]
+     * 2. Разбивает по всем точкам (границы TO, updateDate, границы Allowance)
+     */
+    public void applyTariffOption(TariffOption option) {
+        ensureContinuousCoverage(option.beginDate(), option.endDate());
+
+        Set<LocalDate> points = new TreeSet<>();
+        points.add(option.beginDate());
+        points.add(option.endDate().plusDays(1));
+        if (option.updateDate() != null) points.add(option.updateDate());
+
+        List<Allowance> overlapping =
+                allowanceRepo.findOverlapping(option.beginDate(), option.endDate());
+        for (Allowance a : overlapping) {
+            points.add(a.beginDate());
+            points.add(a.endDate().plusDays(1));
+        }
+
+        for (LocalDate p : points) {
+            splitAt(p);
+        }
+    }
+
+    /**
+     * Применяет Allowance:
+     * 1. Гарантирует непрерывное покрытие периода [beginDate, endDate]
+     * 2. Разбивает по границам Allowance
+     */
+    public void applyAllowance(Allowance allowance) {
+        allowanceRepo.save(allowance);
+
+        ensureContinuousCoverage(allowance.beginDate(), allowance.endDate());
+
+        Set<LocalDate> points = new TreeSet<>();
+        points.add(allowance.beginDate());
+        points.add(allowance.endDate().plusDays(1));
+
+        for (LocalDate p : points) {
+            splitAt(p);
+        }
+    }
+
+    /**
+     * ⭐ КЛЮЧЕВОЙ МЕТОД: гарантирует непрерывное покрытие периода [from, to].
+     *
+     * Логика:
+     * 1. Если нет пересекающихся ставок — создаём одну новую на весь период
+     * 2. Расширяем первую пересекающуюся ставку назад до 'from' (UPDATE beginDate)
+     * 3. Расширяем последнюю пересекающуюся ставку вперёд до 'to' (UPDATE endDate)
+     * 4. Заполняем дыры между соседними ставками новыми записями (INSERT)
+     */
+    private void ensureContinuousCoverage(LocalDate from, LocalDate to) {
+        List<Rate> overlapping = rateRepo.findOverlapping(from, to);
+
+        // Случай 1: нет пересекающихся ставок — создаём одну новую
+        if (overlapping.isEmpty()) {
+            rateRepo.save(new Rate(null, from, to));
+            return;
+        }
+
+        // Сортируем по beginDate для корректной обработки
+        overlapping.sort(Comparator.comparing(Rate::getBeginDate));
+
+        // Случай 2: расширяем первую ставку назад до 'from'
+        Rate first = overlapping.get(0);
+        if (first.getBeginDate().isAfter(from)) {
+            first.setBeginDate(from); // UPDATE beginDate
+        }
+
+        // Случай 3: расширяем последнюю ставку вперёд до 'to'
+        Rate last = overlapping.get(overlapping.size() - 1);
+        if (last.getEndDate().isBefore(to)) {
+            last.setEndDate(to); // UPDATE endDate
+        }
+
+        // Случай 4: заполняем дыры между соседними ставками
+        for (int i = 0; i < overlapping.size() - 1; i++) {
+            Rate current = overlapping.get(i);
+            Rate next = overlapping.get(i + 1);
+
+            LocalDate gapStart = current.getEndDate().plusDays(1);
+            LocalDate gapEnd = next.getBeginDate().minusDays(1);
+
+            if (!gapStart.isAfter(gapEnd)) {
+                // Есть дыра — создаём новую ставку
+                rateRepo.save(new Rate(null, gapStart, gapEnd));
+            }
+            // Если gapStart > gapEnd — ставки идут вплотную или уже перекрываются (не должно быть)
+        }
+    }
+}
