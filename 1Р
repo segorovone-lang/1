@@ -144,3 +144,6 @@ public class RateSplitterOptimized {
         return idGen.getAndIncrement();
     }
 }
+    public boolean covers(LocalDate date) {
+        return !date.isBefore(beginDate) && !date.isAfter(endDate);
+    }
