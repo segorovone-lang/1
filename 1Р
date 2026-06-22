@@ -70,7 +70,6 @@ public class RateSplitter {
      */
     public void applyAllowance(Allowance allowance) {
         allowanceRepo.save(allowance);
-
         ensureContinuousCoverage(allowance.beginDate(), allowance.endDate());
 
         Set<LocalDate> points = new TreeSet<>();
@@ -83,7 +82,7 @@ public class RateSplitter {
     }
 
     /**
-     * ⭐ КЛЮЧЕВОЙ МЕТОД: гарантирует непрерывное покрытие периода [from, to].
+     * Гарантирует непрерывное покрытие периода [from, to].
      *
      * Логика:
      * 1. Если нет пересекающихся ставок — создаём одну новую на весь период
@@ -94,28 +93,23 @@ public class RateSplitter {
     private void ensureContinuousCoverage(LocalDate from, LocalDate to) {
         List<Rate> overlapping = rateRepo.findOverlapping(from, to);
 
-        // Случай 1: нет пересекающихся ставок — создаём одну новую
         if (overlapping.isEmpty()) {
             rateRepo.save(new Rate(null, from, to));
             return;
         }
 
-        // Сортируем по beginDate для корректной обработки
         overlapping.sort(Comparator.comparing(Rate::getBeginDate));
 
-        // Случай 2: расширяем первую ставку назад до 'from'
         Rate first = overlapping.get(0);
         if (first.getBeginDate().isAfter(from)) {
-            first.setBeginDate(from); // UPDATE beginDate
+            first.setBeginDate(from);
         }
 
-        // Случай 3: расширяем последнюю ставку вперёд до 'to'
         Rate last = overlapping.get(overlapping.size() - 1);
         if (last.getEndDate().isBefore(to)) {
-            last.setEndDate(to); // UPDATE endDate
+            last.setEndDate(to);
         }
 
-        // Случай 4: заполняем дыры между соседними ставками
         for (int i = 0; i < overlapping.size() - 1; i++) {
             Rate current = overlapping.get(i);
             Rate next = overlapping.get(i + 1);
@@ -124,10 +118,80 @@ public class RateSplitter {
             LocalDate gapEnd = next.getBeginDate().minusDays(1);
 
             if (!gapStart.isAfter(gapEnd)) {
-                // Есть дыра — создаём новую ставку
                 rateRepo.save(new Rate(null, gapStart, gapEnd));
             }
-            // Если gapStart > gapEnd — ставки идут вплотную или уже перекрываются (не должно быть)
         }
+    }
+}
+package com.example.rates.repository;
+
+import com.example.rates.model.Rate;
+
+import java.time.LocalDate;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+public class RateRepository {
+    private final Map<Long, Rate> storage = new LinkedHashMap<>();
+    private final AtomicLong idGen = new AtomicLong(1);
+
+    public Rate save(Rate rate) {
+        if (rate.getId() == null) {
+            rate = new Rate(idGen.getAndIncrement(), rate.getBeginDate(), rate.getEndDate());
+        }
+        storage.put(rate.getId(), rate);
+        return rate;
+    }
+
+    public Optional<Rate> findCovering(LocalDate date) {
+        return storage.values().stream()
+                .filter(r -> r.covers(date))
+                .findFirst();
+    }
+
+    public List<Rate> findOverlapping(LocalDate from, LocalDate to) {
+        return storage.values().stream()
+                .filter(r -> !r.getEndDate().isBefore(from) && !r.getBeginDate().isAfter(to))
+                .sorted(Comparator.comparing(Rate::getBeginDate))
+                .collect(Collectors.toList());
+    }
+
+    public List<Rate> findAllSorted() {
+        return storage.values().stream()
+                .sorted(Comparator.comparing(Rate::getBeginDate))
+                .collect(Collectors.toList());
+    }
+
+    public void clear() {
+        storage.clear();
+        idGen.set(1);
+    }
+}
+public class AllowanceRepository {
+    private final Map<Long, Allowance> storage = new LinkedHashMap<>();
+    private final AtomicLong idGen = new AtomicLong(1);
+
+    public Allowance save(Allowance a) {
+        if (a.id() == null) {
+            a = new Allowance(idGen.getAndIncrement(), a.beginDate(), a.endDate());
+        }
+        storage.put(a.id(), a);
+        return a;
+    }
+
+    public List<Allowance> findOverlapping(LocalDate from, LocalDate to) {
+        return storage.values().stream()
+                .filter(a -> !a.endDate().isBefore(from) && !a.beginDate().isAfter(to))
+                .collect(Collectors.toList());
+    }
+
+    public List<Allowance> findAll() {
+        return new ArrayList<>(storage.values());
+    }
+
+    public void clear() {
+        storage.clear();
+        idGen.set(1);
     }
 }
