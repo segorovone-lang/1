@@ -1,91 +1,75 @@
-package com.example.rates.service;
-
-import com.example.rates.model.Allowance;
-import com.example.rates.model.Rate;
-import com.example.rates.model.TariffOption;
-
 import java.time.LocalDate;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 
-public class RateSplitter {
+public class RateSplitterOptimized {
 
     private final AtomicLong idGen = new AtomicLong(1);
 
     /**
-     * Основной метод расчёта.
-     *
-     * @param existingRates существующие ставки (будут модифицированы + дополнены новыми)
-     * @param tariffOptions список TariffOption
-     * @param allowances    список Allowance
-     * @return итоговый список ставок (тот же список existingRates, но с новыми записями)
+     * Рассчитывает ставки так, чтобы:
+     * - полностью покрыть периоды tariffOptions и allowances (без дыр),
+     * - разрезать по всем границам и датам обновления,
+     * - не иметь пересекающихся периодов.
+     * Существующие ставки не удаляются, а обновляются (endDate) или дополняются новыми.
      */
     public List<Rate> calculate(
             List<Rate> existingRates,
             List<TariffOption> tariffOptions,
             List<Allowance> allowances
     ) {
-        // Используем ArrayList, чтобы можно было добавлять записи
-        List<Rate> rates = new ArrayList<>(existingRates);
+        // Локальная структура – потокобезопасно
+        TreeMap<LocalDate, Rate> ratesByBeginDate = new TreeMap<>();
 
-        // 1. Собираем все точки разбиения
+        // Копируем, чтобы не изменять исходные объекты
+        for (Rate rate : existingRates) {
+            ratesByBeginDate.put(rate.getBeginDate(), rate.copy());
+        }
+
+        // 1. Собираем все точки разрезов
         Set<LocalDate> splitPoints = collectAllSplitPoints(tariffOptions, allowances);
 
-        // 2. Гарантируем непрерывное покрытие для всех TO и Allowance
+        // 2. Гарантируем непрерывное покрытие для каждого тарифа и надбавки
         for (TariffOption to : tariffOptions) {
-            ensureContinuousCoverage(rates, to.beginDate(), to.endDate());
+            ensureContinuousCoverage(ratesByBeginDate, to.toRange());
         }
         for (Allowance allowance : allowances) {
-            ensureContinuousCoverage(rates, allowance.beginDate(), allowance.endDate());
+            ensureContinuousCoverage(ratesByBeginDate, allowance.toRange());
         }
 
-        // 3. Применяем все точки разбиения (отсортированы по возрастанию)
+        // 3. Разрезаем по всем собранным точкам
         for (LocalDate point : splitPoints) {
-            splitAt(rates, point);
+            splitAt(ratesByBeginDate, point);
         }
 
-        // 4. Сортируем финальный результат
-        rates.sort(Comparator.comparing(Rate::getBeginDate));
-
-        // Возвращаем тот же список, что и входной existingRates (он мутировал)
-        existingRates.clear();
-        existingRates.addAll(rates);
-        return existingRates;
+        return new ArrayList<>(ratesByBeginDate.values());
     }
 
-    /**
-     * Собирает все точки разбиения из всех TO и Allowance.
-     */
-    private Set<LocalDate> collectAllSplitPoints(
-            List<TariffOption> tariffOptions,
-            List<Allowance> allowances
-    ) {
-        Set<LocalDate> points = new TreeSet<>();
-
-        for (TariffOption to : tariffOptions) {
-            points.add(to.beginDate());
-            points.add(to.endDate().plusDays(1));
-            if (to.updateDate() != null) {
-                points.add(to.updateDate());
+    private Rate findCovering(TreeMap<LocalDate, Rate> map, LocalDate date) {
+        Map.Entry<LocalDate, Rate> entry = map.floorEntry(date);
+        if (entry != null) {
+            Rate rate = entry.getValue();
+            if (rate.toRange().covers(date)) {
+                return rate;
             }
         }
-
-        for (Allowance allowance : allowances) {
-            points.add(allowance.beginDate());
-            points.add(allowance.endDate().plusDays(1));
-        }
-
-        return points;
+        return null;
     }
 
-    /**
-     * Разбиение одной записи в точке splitPoint.
-     * Работает напрямую со списком rates.
-     */
-    private void splitAt(List<Rate> rates, LocalDate splitPoint) {
-        Rate found = findCovering(rates, splitPoint);
-        if (found == null) return;
+    private List<Rate> findOverlapping(TreeMap<LocalDate, Rate> map, DateRangeDto range) {
+        List<Rate> result = new ArrayList<>();
+        NavigableMap<LocalDate, Rate> headMap = map.headMap(range.endDate(), true);
+        for (Rate rate : headMap.values()) {
+            if (!rate.getEndDate().isBefore(range.beginDate())) {
+                result.add(rate);
+            }
+        }
+        return result;
+    }
 
+    private void splitAt(TreeMap<LocalDate, Rate> map, LocalDate splitPoint) {
+        Rate found = findCovering(map, splitPoint);
+        if (found == null) return;
         if (found.getBeginDate().equals(splitPoint)) return;
         if (splitPoint.isBefore(found.getBeginDate()) || splitPoint.isAfter(found.getEndDate())) {
             return;
@@ -95,36 +79,32 @@ public class RateSplitter {
         found.setEndDate(splitPoint.minusDays(1));
 
         Rate newRate = new Rate(nextId(), splitPoint, originalEnd);
-        rates.add(newRate);
+        map.put(splitPoint, newRate);
     }
 
-    /**
-     * Гарантирует непрерывное покрытие периода [from, to].
-     */
-    private void ensureContinuousCoverage(List<Rate> rates, LocalDate from, LocalDate to) {
-        List<Rate> overlapping = findOverlapping(rates, from, to);
+    private void ensureContinuousCoverage(TreeMap<LocalDate, Rate> map, DateRangeDto range) {
+        List<Rate> overlapping = findOverlapping(map, range);
 
-        // Случай 1: нет пересекающихся ставок — создаём одну новую
         if (overlapping.isEmpty()) {
-            rates.add(new Rate(nextId(), from, to));
+            Rate newRate = new Rate(nextId(), range.beginDate(), range.endDate());
+            map.put(range.beginDate(), newRate);
             return;
         }
 
         overlapping.sort(Comparator.comparing(Rate::getBeginDate));
 
-        // Случай 2: расширяем первую ставку назад
         Rate first = overlapping.get(0);
-        if (first.getBeginDate().isAfter(from)) {
-            first.setBeginDate(from);
+        if (first.getBeginDate().isAfter(range.beginDate())) {
+            map.remove(first.getBeginDate());
+            first.setBeginDate(range.beginDate());
+            map.put(range.beginDate(), first);
         }
 
-        // Случай 3: расширяем последнюю ставку вперёд
         Rate last = overlapping.get(overlapping.size() - 1);
-        if (last.getEndDate().isBefore(to)) {
-            last.setEndDate(to);
+        if (last.getEndDate().isBefore(range.endDate())) {
+            last.setEndDate(range.endDate());
         }
 
-        // Случай 4: заполняем дыры между соседними ставками
         for (int i = 0; i < overlapping.size() - 1; i++) {
             Rate current = overlapping.get(i);
             Rate next = overlapping.get(i + 1);
@@ -133,26 +113,31 @@ public class RateSplitter {
             LocalDate gapEnd = next.getBeginDate().minusDays(1);
 
             if (!gapStart.isAfter(gapEnd)) {
-                rates.add(new Rate(nextId(), gapStart, gapEnd));
+                Rate gapRate = new Rate(nextId(), gapStart, gapEnd);
+                map.put(gapStart, gapRate);
             }
         }
     }
 
-    // ===== Вспомогательные методы для работы со списками =====
-
-    private Rate findCovering(List<Rate> rates, LocalDate date) {
-        for (Rate r : rates) {
-            if (r.covers(date)) return r;
+    private Set<LocalDate> collectAllSplitPoints(
+            List<TariffOption> tariffOptions,
+            List<Allowance> allowances
+    ) {
+        Set<LocalDate> points = new TreeSet<>();
+        for (TariffOption to : tariffOptions) {
+            DateRangeDto range = to.toRange();
+            points.add(range.beginDate());
+            points.add(range.dayAfterEnd());
+            if (to.updateDate() != null) {
+                points.add(to.updateDate());
+            }
         }
-        return null;
-    }
-
-    private List<Rate> findOverlapping(List<Rate> rates, LocalDate from, LocalDate to) {
-        List<Rate> result = new ArrayList<>();
-        for (Rate r : rates) {
-            if (r.overlaps(from, to)) result.add(r);
+        for (Allowance allowance : allowances) {
+            DateRangeDto range = allowance.toRange();
+            points.add(range.beginDate());
+            points.add(range.dayAfterEnd());
         }
-        return result;
+        return points;
     }
 
     private Long nextId() {
