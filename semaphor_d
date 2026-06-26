@@ -1,0 +1,295 @@
+// ================== 0. DTO и вспомогательные классы ==================
+@Data
+@Builder
+public class CalculationResult {
+    private Long taskId;
+    private Long productInstanceId;
+    private List<BaseRateDto> baseRates;      // 1-2 элемента
+    private List<SurchargeDto> surcharges;    // 4-5 элементов
+    private List<FinalRateDto> finalRates;    // 5-10 элементов
+    private BigDecimal finalRate;
+    private String newHash;
+    private boolean performed;                // true – данные изменились
+    private boolean failed;                   // true – ошибка при расчёте
+
+    public static CalculationResult failed(Long taskId) {
+        return CalculationResult.builder().taskId(taskId).failed(true).build();
+    }
+}
+
+@Data
+@AllArgsConstructor
+public class BaseRateDto {
+    private UUID id;
+    private UUID calculationId;
+    private BigDecimal rate;
+    private LocalDate validFrom;
+    private LocalDate validTo;
+}
+
+@Data
+@AllArgsConstructor
+public class SurchargeDto {
+    private UUID id;
+    private UUID calculationId;
+    private String type;
+    private BigDecimal value;
+    private LocalDate validFrom;
+    private LocalDate validTo;
+}
+
+@Data
+@AllArgsConstructor
+public class FinalRateDto {
+    private UUID id;
+    private UUID calculationId;
+    private BigDecimal rate;
+    private LocalDate periodStart;
+    private LocalDate periodEnd;
+}
+
+// Простая реализация UUIDv7 (используем библиотеку 'com.fasterxml.uuid:java-uuid-generator')
+public class UuidV7Generator {
+    private static final com.fasterxml.uuid.Generator GENERATOR =
+            com.fasterxml.uuid.Generators.timeBasedEpochGenerator();
+    public static UUID generate() {
+        return GENERATOR.generate();
+    }
+}
+
+// ================== 1. Основной процессор ==================
+@Component
+@RequiredArgsConstructor
+public class OptimizedBatchProcessor {
+    private final JdbcTemplate jdbc;
+    private final RateCalculationService calcService;
+    private final ProductInstanceRepository productRepo;
+
+    private final Executor cpuPool = Executors.newFixedThreadPool(30);
+    private final int fetchBatchSize = 200;
+    private final int insertChunkSize = 100;
+    private final int lockTimeoutMinutes = 5;
+    private final int workerCount = 2;
+
+    private final Semaphore writePermits = new Semaphore(2);
+
+    @PostConstruct
+    public void startWorkers() {
+        for (int i = 0; i < workerCount; i++) {
+            Thread worker = new Thread(() -> {
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        List<TaskEvent> batch = fetchAndLockBatch();
+                        if (batch.isEmpty()) {
+                            Thread.sleep(100);
+                            continue;
+                        }
+                        BatchResult result = processBatch(batch);
+                        writeInChunks(result);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    } catch (Exception e) {
+                        log.error("Worker error", e);
+                    }
+                }
+            }, "worker-" + i);
+            worker.start();
+        }
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public List<TaskEvent> fetchAndLockBatch() {
+        String sql = """
+            UPDATE task_event SET status = 'INPROGRESS', lock_until = :lockUntil
+            WHERE id IN (
+                SELECT id FROM task_event
+                WHERE status IN ('CREATED','INPROGRESS')
+                  AND (lock_until IS NULL OR lock_until < now())
+                ORDER BY created
+                LIMIT :limit
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, product_instance_id
+        """;
+        LocalDateTime lockUntil = LocalDateTime.now().plusMinutes(lockTimeoutMinutes);
+        return jdbc.query(sql, Map.of("limit", fetchBatchSize, "lockUntil", lockUntil),
+            (rs, rowNum) -> new TaskEvent(rs.getLong("id"), rs.getLong("product_instance_id")));
+    }
+
+    private BatchResult processBatch(List<TaskEvent> tasks) {
+        Map<Long, ProductInstance> products = loadProducts(tasks);
+        List<CompletableFuture<CalculationResult>> futures = tasks.stream()
+            .map(task -> CompletableFuture.supplyAsync(() -> {
+                ProductInstance product = products.get(task.getProductInstanceId());
+                if (product == null) return CalculationResult.failed(task.getId());
+                return calcService.calculate(task, product);
+            }, cpuPool).exceptionally(ex -> {
+                log.error("Task {} failed", task.getId(), ex);
+                return CalculationResult.failed(task.getId());
+            }))
+            .toList();
+        CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
+
+        List<CalculationResult> results = futures.stream().map(CompletableFuture::join).toList();
+        List<Long> failedIds = results.stream().filter(CalculationResult::isFailed)
+                .map(CalculationResult::getTaskId).toList();
+        List<CalculationResult> performed = results.stream()
+                .filter(r -> !r.isFailed() && r.isPerformed()).toList();
+        List<Long> unchangedIds = results.stream()
+                .filter(r -> !r.isFailed() && !r.isPerformed()).map(CalculationResult::getTaskId).toList();
+
+        return new BatchResult(performed, unchangedIds, failedIds);
+    }
+
+    private void writeInChunks(BatchResult batch) {
+        List<CalculationResult> performed = batch.performed();
+        List<List<CalculationResult>> chunks = partition(performed, insertChunkSize);
+
+        for (List<CalculationResult> chunk : chunks) {
+            boolean written = false;
+            int retries = 3;
+            while (!written && retries-- > 0) {
+                try {
+                    writePermits.acquire();
+                    try {
+                        persistChunk(chunk);
+                        written = true;
+                    } finally {
+                        writePermits.release();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted during chunk write", e);
+                } catch (Exception e) {
+                    log.error("Chunk write failed, retries left: {}", retries, e);
+                    if (retries == 0) throw e;
+                    try {
+                        Thread.sleep(100 * (3 - retries));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted during retry sleep", ie);
+                    }
+                }
+            }
+        }
+
+        updateRemainingStatuses(batch.unchanged(), batch.failed());
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void persistChunk(List<CalculationResult> chunk) {
+        List<Object[]> calcParams = new ArrayList<>();
+        List<Object[]> baseRateParams = new ArrayList<>();
+        List<Object[]> surchargeParams = new ArrayList<>();
+        List<Object[]> finalRateParams = new ArrayList<>();
+        List<Object[]> hashParams = new ArrayList<>();
+
+        for (CalculationResult r : chunk) {
+            UUID calcId = UuidV7Generator.generate();
+            calcParams.add(new Object[]{calcId, r.getTaskId(), r.getProductInstanceId(),
+                r.getFinalRate(), Timestamp.valueOf(LocalDateTime.now())});
+
+            for (BaseRateDto br : r.getBaseRates()) {
+                br.setId(UuidV7Generator.generate());
+                br.setCalculationId(calcId);
+                baseRateParams.add(new Object[]{br.getId(), br.getCalculationId(), br.getRate(),
+                    br.getValidFrom(), br.getValidTo()});
+            }
+            for (SurchargeDto s : r.getSurcharges()) {
+                s.setId(UuidV7Generator.generate());
+                s.setCalculationId(calcId);
+                surchargeParams.add(new Object[]{s.getId(), s.getCalculationId(), s.getType(),
+                    s.getValue(), s.getValidFrom(), s.getValidTo()});
+            }
+            for (FinalRateDto fr : r.getFinalRates()) {
+                fr.setId(UuidV7Generator.generate());
+                fr.setCalculationId(calcId);
+                finalRateParams.add(new Object[]{fr.getId(), fr.getCalculationId(), fr.getRate(),
+                    fr.getPeriodStart(), fr.getPeriodEnd()});
+            }
+            hashParams.add(new Object[]{r.getNewHash(), r.getProductInstanceId()});
+        }
+
+        jdbc.batchUpdate("INSERT INTO calculation (id, task_id, product_instance_id, final_rate, calculated_at) " +
+            "VALUES (?,?,?,?,?) ON CONFLICT (task_id) DO NOTHING", calcParams, 500);
+        jdbc.batchUpdate("INSERT INTO base_rate (id, calculation_id, rate, valid_from, valid_to) VALUES (?,?,?,?,?)",
+            baseRateParams, 500);
+        jdbc.batchUpdate("INSERT INTO surcharge (id, calculation_id, type, value, valid_from, valid_to) VALUES (?,?,?,?,?,?)",
+            surchargeParams, 500);
+        jdbc.batchUpdate("INSERT INTO final_rate (id, calculation_id, rate, period_start, period_end) VALUES (?,?,?,?,?)",
+            finalRateParams, 500);
+        jdbc.batchUpdate("UPDATE product_instance SET calculation_hash = ? WHERE id = ?", hashParams, 500);
+
+        // Обновление статусов внутри той же транзакции
+        List<Object[]> completedParams = new ArrayList<>();
+        for (CalculationResult r : chunk) {
+            completedParams.add(new Object[]{r.getTaskId()});
+        }
+        if (!completedParams.isEmpty()) {
+            jdbc.batchUpdate("UPDATE task_event SET status = 'COMPLETED', lock_until = NULL WHERE id = ?",
+                completedParams, 500);
+        }
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void updateRemainingStatuses(List<Long> unchanged, List<Long> failed) {
+        if (!unchanged.isEmpty()) {
+            jdbc.batchUpdate("UPDATE task_event SET status = 'COMPLETED', lock_until = NULL WHERE id = ?",
+                unchanged.stream().map(id -> new Object[]{id}).toList(), 500);
+        }
+        if (!failed.isEmpty()) {
+            jdbc.batchUpdate("UPDATE task_event SET status = 'FAILED', lock_until = NULL WHERE id = ?",
+                failed.stream().map(id -> new Object[]{id}).toList(), 500);
+        }
+    }
+
+    private Map<Long, ProductInstance> loadProducts(List<TaskEvent> tasks) {
+        List<Long> ids = tasks.stream().map(TaskEvent::getProductInstanceId).distinct().toList();
+        return productRepo.findAllById(ids).stream()
+                .collect(Collectors.toMap(ProductInstance::getId, Function.identity()));
+    }
+
+    private <T> List<List<T>> partition(List<T> list, int size) {
+        List<List<T>> partitions = new ArrayList<>();
+        for (int i = 0; i < list.size(); i += size) {
+            partitions.add(list.subList(i, Math.min(i + size, list.size())));
+        }
+        return partitions;
+    }
+
+    // record для результата батча
+    private record BatchResult(List<CalculationResult> performed, List<Long> unchanged, List<Long> failed) {}
+
+    // Очистка зависших задач
+    @Scheduled(fixedDelay = 120_000)
+    @Transactional
+    public void cleanupStaleTasks() {
+        jdbc.update("UPDATE task_event SET status = 'CREATED', lock_until = NULL " +
+                "WHERE status = 'INPROGRESS' AND lock_until < now()");
+    }
+}
+
+// ================== 2. Сервис расчёта (без БД) ==================
+@Service
+@RequiredArgsConstructor
+public class RateCalculationService {
+    private final RateEngine rateEngine;
+
+    public CalculationResult calculate(TaskEvent task, ProductInstance product) {
+        // Реализация расчёта ставок, надбавок, финальных ставок и хеша
+        // Возвращает CalculationResult с performed = true/false
+    }
+}
+
+// ================== 3. Модель задачи ==================
+@Data
+@AllArgsConstructor
+public class TaskEvent {
+    private Long id;
+    private Long productInstanceId;
+}
+
+// ================== 4. Репозиторий продукта (JPA или JDBC – неважно) ==================
+@Repository
+public interface ProductInstanceRepository extends JpaRepository<ProductInstance, Long> {}
