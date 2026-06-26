@@ -1,0 +1,120 @@
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RateCalculationBatchOrchestrator {
+
+    private final TaskRepository taskRepository;
+    private final RateCalculationEngine engine;
+    private final RateComputationRepository computationRepo;
+    private final DistributedLockService lockService;
+    private final IdempotencyService idempotencyService;
+    private final ProductInstanceCacheService instanceCache;
+    private final TransactionTemplate transactionTemplate;
+    private final Semaphore taskProcessingSemaphore;
+
+    @Qualifier("virtualThreadExecutor")
+    private final Executor virtualThreadExecutor;
+
+    @Qualifier("dbWriterExecutor")
+    private final Executor dbWriterExecutor;
+
+    private static final int BATCH_SIZE = 200;
+
+    /**
+     * Пытается прочитать и обработать батч задач.
+     * @return true если задачи были прочитаны, false если семафор переполнен
+     */
+    public boolean tryExecuteBatch() {
+        // 1. Проверяем семафор перед чтением
+        if (!taskProcessingSemaphore.tryAcquire()) {
+            log.debug("Semaphore is full, skipping batch read");
+            return false;
+        }
+
+        try {
+            // 2. Читаем батч с FOR UPDATE SKIP LOCKED
+            List<Task> batch = taskRepository.claimNextBatch(BATCH_SIZE);
+            if (batch.isEmpty()) {
+                // Освобождаем permit, если задач нет
+                taskProcessingSemaphore.release();
+                return false;
+            }
+
+            log.info("Claimed {} tasks, semaphore available: {}", 
+                    batch.size(), taskProcessingSemaphore.availablePermits());
+
+            // 3. Для каждой задачи: расчет → запись → release semaphore
+            List<CompletableFuture<Void>> futures = batch.stream()
+                    .map(task -> CompletableFuture
+                            .supplyAsync(() -> processTask(task), virtualThreadExecutor)
+                            .thenApplyAsync(result -> persistResult(result), dbWriterExecutor)
+                            .whenComplete((result, ex) -> {
+                                // Освобождаем семафор после завершения задачи
+                                taskProcessingSemaphore.release();
+                                
+                                if (ex != null) {
+                                    log.error("Task {} failed: {}", task.getId(), ex.getMessage());
+                                    idempotencyService.markFailed(task.getId());
+                                }
+                            })
+                    )
+                    .toList();
+
+            // 4. Не ждем завершения — возвращаем управление сразу
+            // Задачи выполняются асинхронно, семафор освобождается в whenComplete
+            return true;
+
+        } catch (Exception e) {
+            // Если что-то пошло не так при чтении — освобождаем permit
+            taskProcessingSemaphore.release();
+            log.error("Failed to read batch", e);
+            return false;
+        }
+    }
+
+    private Optional<RateComputationResult> processTask(Task task) {
+        // 1. Проверка идемпотентности
+        if (!idempotencyService.tryMarkProcessing(task.getId())) {
+            log.debug("Task {} already processed or processing", task.getId());
+            return Optional.empty();
+        }
+
+        // 2. Захват lock по productInstanceId
+        RLock lock = lockService.tryLockInstance(task.getProductInstanceId());
+        if (lock == null) {
+            log.warn("Could not acquire lock for instance {}", task.getProductInstanceId());
+            idempotencyService.markFailed(task.getId());
+            return Optional.empty();
+        }
+
+        try {
+            // 3. Загрузка экземпляра (с кешем)
+            ProductInstance instance = instanceCache.getOrLoad(task.getProductInstanceId());
+            
+            // 4. Расчет
+            RateComputationResult result = engine.calculate(task, instance);
+            return Optional.of(result);
+        } finally {
+            lockService.unlock(lock);
+        }
+    }
+
+    private Void persistResult(Optional<RateComputationResult> resultOpt) {
+        if (resultOpt.isEmpty()) return null;
+
+        RateComputationResult result = resultOpt.get();
+        
+        transactionTemplate.executeWithoutResult(status -> {
+            computationRepo.saveBatch(List.of(result));
+        });
+
+        // 5. Помечаем задачу как выполненную
+        idempotencyService.markDone(result.getTask().getId());
+        
+        // 6. Инвалидируем кеш экземпляра
+        instanceCache.invalidate(result.getTask().getProductInstanceId());
+
+        log.debug("Task {} persisted", result.getTask().getId());
+        return null;
+    }
+}
