@@ -1,0 +1,87 @@
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class BatchScheduler {
+
+    private final RateCalculationBatchOrchestrator orchestrator;
+
+    @Qualifier("readerExecutor")
+    private final ScheduledExecutorService readerExecutor;
+
+    private static final long MIN_PAUSE_MS = 500;
+    private static final long MAX_PAUSE_MS = 30_000; // 30 секунд
+    private static final double BACKOFF_MULTIPLIER = 2.0;
+
+    @PostConstruct
+    public void start() {
+        // Запускаем 2 потока чтения
+        for (int i = 0; i < 2; i++) {
+            final int readerId = i;
+            readerExecutor.submit(() -> runReaderLoop(readerId));
+        }
+    }
+
+    private void runReaderLoop(int readerId) {
+        long currentPauseMs = MIN_PAUSE_MS;
+        
+        log.info("Reader-{} started", readerId);
+
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                boolean hasTasks = orchestrator.tryExecuteBatch();
+
+                if (hasTasks) {
+                    // Успешно прочитали — сбрасываем паузу к минимуму
+                    if (currentPauseMs > MIN_PAUSE_MS) {
+                        log.info("Reader-{}: semaphore available, resetting pause to {}ms", 
+                                readerId, MIN_PAUSE_MS);
+                    }
+                    currentPauseMs = MIN_PAUSE_MS;
+                } else {
+                    // Семафор переполнен или задач нет — увеличиваем паузу
+                    currentPauseMs = Math.min(
+                            (long) (currentPauseMs * BACKOFF_MULTIPLIER), 
+                            MAX_PAUSE_MS
+                    );
+                    log.debug("Reader-{}: no tasks or semaphore full, pausing {}ms", 
+                            readerId, currentPauseMs);
+                }
+
+                Thread.sleep(currentPauseMs);
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.info("Reader-{} interrupted, shutting down", readerId);
+                break;
+            } catch (Exception e) {
+                log.error("Reader-{}: unexpected error", readerId, e);
+                // При ошибке тоже делаем паузу
+                try {
+                    Thread.sleep(currentPauseMs);
+                    currentPauseMs = Math.min(
+                            (long) (currentPauseMs * BACKOFF_MULTIPLIER), 
+                            MAX_PAUSE_MS
+                    );
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+
+        log.info("Reader-{} stopped", readerId);
+    }
+
+    @PreDestroy
+    public void stop() {
+        readerExecutor.shutdown();
+        try {
+            if (!readerExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                readerExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            readerExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+}
