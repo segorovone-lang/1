@@ -1,0 +1,61 @@
+import java.util.concurrent.Semaphore;
+
+public class BoundedSemaphore extends Semaphore {
+    private final int maxPermits;
+
+    public BoundedSemaphore(int permits) {
+        super(permits);
+        this.maxPermits = permits;
+    }
+
+    public BoundedSemaphore(int permits, boolean fair) {
+        super(permits, fair);
+        this.maxPermits = permits;
+    }
+
+    /**
+     * Releases a single permit, but only if it does NOT cause the number
+     * of available permits to exceed the initial maximum.
+     *
+     * @throws IllegalStateException if release would exceed max capacity
+     */
+    @Override
+    public void release() {
+        release(1);
+    }
+
+    /**
+     * Releases the given number of permits, but only if it does NOT cause
+     * the number of available permits to exceed the initial maximum.
+     *
+     * @param permits number of permits to release
+     * @throws IllegalArgumentException if permits is negative
+     * @throws IllegalStateException    if release would exceed max capacity
+     */
+    @Override
+    public void release(int permits) {
+        if (permits < 0) {
+            throw new IllegalArgumentException("permits must be non-negative");
+        }
+        // Synchronize to make the check‑and‑act atomic.
+        // Locking on 'this' is safe because we are extending the class.
+        synchronized (this) {
+            int currentAvailable = super.availablePermits();
+            if (currentAvailable + permits > maxPermits) {
+                throw new IllegalStateException(
+                    String.format(
+                        "Release of %d permit(s) would exceed maximum of %d. Available now: %d",
+                        permits, maxPermits, currentAvailable
+                    )
+                );
+            }
+            // Safe to release – delegate to the real implementation.
+            super.release(permits);
+        }
+    }
+
+    /** Expose the maximum capacity for convenience. */
+    public int getMaxPermits() {
+        return maxPermits;
+    }
+}
