@@ -1,23 +1,25 @@
 import java.util.concurrent.Semaphore;
 
-public class BoundedSemaphore extends Semaphore {
+/**
+ * A Semaphore that never allows the number of available permits
+ * to exceed the initial maximum. Any release attempt that would
+ * go over the limit is silently capped.
+ */
+public class SafeReleaseSemaphore extends Semaphore {
     private final int maxPermits;
 
-    public BoundedSemaphore(int permits) {
+    public SafeReleaseSemaphore(int permits) {
         super(permits);
         this.maxPermits = permits;
     }
 
-    public BoundedSemaphore(int permits, boolean fair) {
+    public SafeReleaseSemaphore(int permits, boolean fair) {
         super(permits, fair);
         this.maxPermits = permits;
     }
 
     /**
-     * Releases a single permit, but only if it does NOT cause the number
-     * of available permits to exceed the initial maximum.
-     *
-     * @throws IllegalStateException if release would exceed max capacity
+     * Releases a single permit, capped to the maximum allowed.
      */
     @Override
     public void release() {
@@ -25,36 +27,27 @@ public class BoundedSemaphore extends Semaphore {
     }
 
     /**
-     * Releases the given number of permits, but only if it does NOT cause
-     * the number of available permits to exceed the initial maximum.
+     * Releases permits up to the maximum. If the requested number
+     * would exceed the cap, only the remaining capacity is released.
      *
-     * @param permits number of permits to release
-     * @throws IllegalArgumentException if permits is negative
-     * @throws IllegalStateException    if release would exceed max capacity
+     * @param permits requested permits to release (non‑negative)
      */
     @Override
     public void release(int permits) {
         if (permits < 0) {
             throw new IllegalArgumentException("permits must be non-negative");
         }
-        // Synchronize to make the check‑and‑act atomic.
-        // Locking on 'this' is safe because we are extending the class.
+        // Atomic check‑and‑act to avoid race conditions
         synchronized (this) {
-            int currentAvailable = super.availablePermits();
-            if (currentAvailable + permits > maxPermits) {
-                throw new IllegalStateException(
-                    String.format(
-                        "Release of %d permit(s) would exceed maximum of %d. Available now: %d",
-                        permits, maxPermits, currentAvailable
-                    )
-                );
+            int available = super.availablePermits();
+            int allowed = Math.min(permits, maxPermits - available);
+            if (allowed > 0) {
+                super.release(allowed);
             }
-            // Safe to release – delegate to the real implementation.
-            super.release(permits);
+            // If allowed == 0, do nothing – we are already at capacity.
         }
     }
 
-    /** Expose the maximum capacity for convenience. */
     public int getMaxPermits() {
         return maxPermits;
     }
