@@ -1,0 +1,17 @@
+import org.redisson.api.RedissonClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class AssignmentStrategyConfig {
+
+    @Bean(destroyMethod = "release")
+    public LeaseBasedAssignmentStrategy leaseBasedStrategy(RedissonClient redisson) {
+        return new LeaseBasedAssignmentStrategy(redisson);
+    }
+
+    @Bean
+    public PodIdentityAssignmentStrategy podIdentityStrategy() {
+        return new PodIdentityAssignmentStrategy();
+    }
+}
