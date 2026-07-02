@@ -1,0 +1,134 @@
+import org.redisson.api.RMapCache;
+import org.redisson.api.RedissonClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import jakarta.annotation.PreDestroy;
+import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.*;
+
+public class LeaseBasedAssignmentStrategy implements ThreadAssignmentStrategy {
+
+    private static final Logger log = LoggerFactory.getLogger(LeaseBasedAssignmentStrategy.class);
+
+    private static final String SLOTS_KEY = "worker_slots";
+    private static final long SLOT_TTL_SECONDS = 30;
+    private static final long REFRESH_INTERVAL_SECONDS = 10;
+    private static final long ACQUIRE_TIMEOUT_SECONDS = 30;
+
+    private final RedissonClient redisson;
+    private final String podId;
+    private final ScheduledExecutorService refreshExecutor;
+    private ScheduledFuture<?> refreshTask;
+    private final List<Integer> ownedSlots = new CopyOnWriteArrayList<>();
+
+    public LeaseBasedAssignmentStrategy(RedissonClient redisson) {
+        this.redisson = redisson;
+        this.podId = generatePodId();
+        this.refreshExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "slot-lease-refresher");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    private String generatePodId() {
+        try {
+            return InetAddress.getLocalHost().getHostName() + "-" +
+                   UUID.randomUUID().toString().substring(0, 8);
+        } catch (Exception e) {
+            return "pod-" + UUID.randomUUID().toString().substring(0, 12);
+        }
+    }
+
+    @Override
+    public List<Integer> assign(int threadsPerPod, int totalHashPartitions) {
+        RMapCache<Integer, String> slots = redisson.getMapCache(SLOTS_KEY);
+        long deadline = System.currentTimeMillis() + ACQUIRE_TIMEOUT_SECONDS * 1000;
+
+        log.info("Pod {} attempting to acquire {} slots (of {} total)",
+                 podId, threadsPerPod, totalHashPartitions);
+
+        while (ownedSlots.size() < threadsPerPod) {
+            if (System.currentTimeMillis() > deadline) {
+                throw new AssignmentException(
+                    "Timeout: could not acquire " + threadsPerPod +
+                    " slots within " + ACQUIRE_TIMEOUT_SECONDS + "s", null);
+            }
+
+            // Try each slot in order
+            for (int slot = 0; slot < totalHashPartitions; slot++) {
+                if (ownedSlots.size() >= threadsPerPod) break;
+                if (ownedSlots.contains(slot)) continue;
+
+                // Atomic: claim slot only if free (or already ours)
+                String previous = slots.putIfAbsent(
+                        slot, podId, SLOT_TTL_SECONDS, TimeUnit.SECONDS);
+
+                if (previous == null || previous.equals(podId)) {
+                    ownedSlots.add(slot);
+                    log.info("Pod {} claimed slot {}", podId, slot);
+                }
+            }
+
+            if (ownedSlots.size() < threadsPerPod) {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssignmentException("Interrupted during acquisition", e);
+                }
+            }
+        }
+
+        startLeaseRefresh(slots);
+        log.info("Pod {} successfully leased slots: {}", podId, ownedSlots);
+        return new ArrayList<>(ownedSlots);
+    }
+
+    /**
+     * Background task: refresh TTL on owned slots every REFRESH_INTERVAL_SECONDS.
+     * If this pod crashes, the refresh stops and slots expire naturally.
+     */
+    private void startLeaseRefresh(RMapCache<Integer, String> slots) {
+        refreshTask = refreshExecutor.scheduleAtFixedRate(() -> {
+            try {
+                for (int slot : ownedSlots) {
+                    // Re-put with fresh TTL (atomic)
+                    slots.fastPut(slot, podId, SLOT_TTL_SECONDS, TimeUnit.SECONDS);
+                }
+            } catch (Exception e) {
+                log.warn("Failed to refresh lease for slots {}: {}",
+                         ownedSlots, e.getMessage());
+            }
+        }, REFRESH_INTERVAL_SECONDS, REFRESH_INTERVAL_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /**
+     * On graceful shutdown, release slots immediately so other pods can claim them
+     * without waiting for TTL expiry.
+     */
+    @PreDestroy
+    public void release() {
+        log.info("Pod {} releasing slots: {}", podId, ownedSlots);
+        if (refreshTask != null) {
+            refreshTask.cancel(false);
+        }
+        try {
+            RMapCache<Integer, String> slots = redisson.getMapCache(SLOTS_KEY);
+            for (int slot : ownedSlots) {
+                // Only remove if we still own it (don't clobber a new owner)
+                slots.remove(slot, podId);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to release slots cleanly: {}", e.getMessage());
+        }
+        refreshExecutor.shutdown();
+    }
+
+    @Override
+    public String name() { return "LEASE_BASED"; }
+}
