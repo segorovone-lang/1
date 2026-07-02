@@ -1,0 +1,52 @@
+@Component
+public class ThreadAssignmentCoordinator {
+
+    private static final Logger log = LoggerFactory.getLogger(ThreadAssignmentCoordinator.class);
+
+    private final List<ThreadAssignmentStrategy> strategies;
+
+    @Value("${worker.assignment.timeout-ms:2000}")
+    private long timeoutMs;
+
+    private final ExecutorService timeoutExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "assignment-timeout");
+        t.setDaemon(true);
+        return t;
+    });
+
+    public ThreadAssignmentCoordinator(
+            LeaseBasedAssignmentStrategy leaseStrategy,
+            PodIdentityAssignmentStrategy podStrategy) {
+        this.strategies = List.of(leaseStrategy, podStrategy);
+    }
+
+    public List<Integer> assign(int threadsPerPod, int totalHashPartitions) {
+        for (ThreadAssignmentStrategy strategy : strategies) {
+            try {
+                log.info("Trying assignment strategy: {}", strategy.name());
+                List<Integer> result = runWithTimeout(
+                        () -> strategy.assign(threadsPerPod, totalHashPartitions),
+                        timeoutMs);
+                log.info("Assignment successful via: {}", strategy.name());
+                return result;
+            } catch (Exception e) {
+                log.warn("Strategy {} failed: {}", strategy.name(), e.getMessage());
+            }
+        }
+        throw new IllegalStateException("All assignment strategies failed");
+    }
+
+    private <T> T runWithTimeout(Callable<T> task, long timeoutMs) throws Exception {
+        Future<T> future = timeoutExecutor.submit(task);
+        try {
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException te) {
+            future.cancel(true);
+            throw new AssignmentException("Timed out after " + timeoutMs + "ms", te);
+        } catch (ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            if (cause instanceof AssignmentException) throw (AssignmentException) cause;
+            throw new AssignmentException("Execution failed", cause);
+        }
+    }
+}
