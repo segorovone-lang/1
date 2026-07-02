@@ -1,0 +1,57 @@
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class PodIdentityAssignmentStrategy implements ThreadAssignmentStrategy {
+
+    private static final Logger log = LoggerFactory.getLogger(PodIdentityAssignmentStrategy.class);
+    // Matches StatefulSet hostnames like "myapp-0", "worker-12", etc.
+    private static final Pattern ORDINAL_PATTERN = Pattern.compile("-(\\d+)$");
+
+    @Override
+    public List<Integer> assign(int threadsPerPod, int totalHashPartitions) {
+        try {
+            String hostname = InetAddress.getLocalHost().getHostName();
+            int podIndex = extractPodIndex(hostname);
+
+            List<Integer> remainders = new ArrayList<>(threadsPerPod);
+            for (int i = 0; i < threadsPerPod; i++) {
+                int globalId = podIndex * threadsPerPod + i;
+                int remainder = Math.floorMod(globalId, totalHashPartitions);
+                remainders.add(remainder);
+            }
+
+            log.warn("Using POD_IDENTITY fallback (hostname={}, parsedIndex={}). " +
+                     "Assigned remainders: {}. Overlap with other pods is possible " +
+                     "but safe due to SKIP LOCKED.",
+                     hostname, podIndex, remainders);
+            return remainders;
+        } catch (Exception e) {
+            throw new AssignmentException("Pod identity assignment failed", e);
+        }
+    }
+
+    /**
+     * Tries to parse the trailing ordinal from the hostname.
+     * Falls back to a deterministic hash of the hostname if no ordinal is found.
+     */
+    private int extractPodIndex(String hostname) {
+        Matcher m = ORDINAL_PATTERN.matcher(hostname);
+        if (m.find()) {
+            return Integer.parseInt(m.group(1));
+        }
+        // No ordinal found (e.g., Deployment with random suffix).
+        // Hash the hostname for a deterministic, per-host value.
+        int hash = hostname.hashCode();
+        // Use absolute value and keep it in a reasonable range
+        return Math.abs(hash % 1024);
+    }
+
+    @Override
+    public String name() { return "POD_IDENTITY"; }
+}
