@@ -1,0 +1,22 @@
+-- 1. Root table (range partitioned by operdate)
+CREATE TABLE my_table (
+    operdate date NOT NULL,
+    id bigint NOT NULL,
+    payload jsonb,
+    PRIMARY KEY (operdate, id)
+) PARTITION BY RANGE (operdate);
+
+-- 2. Monthly range partition
+CREATE TABLE my_table_202607 PARTITION OF my_table
+    FOR VALUES FROM ('2026-07-01') TO ('2026-08-01')
+    PARTITION BY HASH (id);
+
+-- 3. Create 8 hash sub-partitions
+DO $$
+BEGIN
+    FOR i IN 0..7 LOOP
+        EXECUTE format(
+            'CREATE TABLE my_table_202607_p%I PARTITION OF my_table_202607
+             FOR VALUES WITH (MODULUS 8, REMAINDER %s)', i, i);
+    END LOOP;
+END $$;
