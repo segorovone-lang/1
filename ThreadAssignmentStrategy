@@ -1,0 +1,12 @@
+import java.util.List;
+
+public interface ThreadAssignmentStrategy {
+    /**
+     * Returns the list of hash partition remainders (0..N-1) this pod should handle.
+     * @throws AssignmentException if this strategy cannot produce an assignment
+     */
+    List<Integer> assign(int threadsPerPod, int totalHashPartitions);
+
+    /** Human-readable name for logging */
+    String name();
+}
