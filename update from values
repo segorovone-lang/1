@@ -1,0 +1,98 @@
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+
+@Repository
+public class ProductBatchRepository {
+
+    private final JdbcTemplate jdbcTemplate;
+
+    // Number of rows per individual UPDATE statement
+    private static final int BATCH_SIZE = 500;
+
+    public ProductBatchRepository(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    /**
+     * Updates a list of products using PostgreSQL's UPDATE ... FROM (VALUES ...)
+     * in efficient batches.
+     */
+    public void batchUpdateProducts(List<Product> products) {
+        if (products.isEmpty()) return;
+
+        // Build the SQL template with BATCH_SIZE rows in VALUES.
+        // Each row: (?, ?, ?)  -> id, name, price
+        String sql = buildUpdateSql(BATCH_SIZE);
+
+        // Prepare the parameter arrays – one array per batch
+        List<Object[]> batchArgs = new ArrayList<>();
+
+        for (int i = 0; i < products.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, products.size());
+            List<Product> chunk = products.subList(i, end);
+
+            // If the last chunk is smaller, build a dedicated SQL for it
+            if (chunk.size() < BATCH_SIZE) {
+                updateSmallChunk(chunk);
+            } else {
+                // Flatten the chunk into a single Object[]
+                Object[] params = flattenParameters(chunk);
+                batchArgs.add(params);
+            }
+        }
+
+        // Execute all full-size batches at once
+        if (!batchArgs.isEmpty()) {
+            jdbcTemplate.batchUpdate(sql, batchArgs);
+        }
+    }
+
+    // --------------------------------------------------------------
+    // Helper methods
+    // --------------------------------------------------------------
+
+    /**
+     * Creates an UPDATE ... FROM (VALUES ...) statement with exactly 'rows' rows.
+     * Example for rows=2:
+     *   UPDATE product AS p SET name = v.name, price = v.price
+     *   FROM (VALUES (?, ?, ?), (?, ?, ?)) AS v(id, name, price)
+     *   WHERE p.id = v.id
+     */
+    private String buildUpdateSql(int rows) {
+        StringBuilder sql = new StringBuilder(
+            "UPDATE product AS p SET name = v.name, price = v.price FROM (VALUES "
+        );
+
+        for (int i = 0; i < rows; i++) {
+            if (i > 0) sql.append(", ");
+            sql.append("(?, ?, ?)");          // id, name, price
+        }
+        sql.append(") AS v(id, name, price) WHERE p.id = v.id");
+        return sql.toString();
+    }
+
+    private Object[] flattenParameters(List<Product> products) {
+        Object[] params = new Object[products.size() * 3];
+        int idx = 0;
+        for (Product p : products) {
+            params[idx++] = p.getId();
+            params[idx++] = p.getName();
+            params[idx++] = p.getPrice();
+        }
+        return params;
+    }
+
+    /**
+     * Handles the final (possibly smaller) chunk with a dedicated SQL.
+     * Small chunks are executed individually – the overhead is negligible.
+     */
+    private void updateSmallChunk(List<Product> chunk) {
+        if (chunk.isEmpty()) return;
+        String sql = buildUpdateSql(chunk.size());
+        Object[] params = flattenParameters(chunk);
+        jdbcTemplate.update(sql, (Object[]) params);   // single update
+    }
+}
