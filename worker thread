@@ -1,0 +1,129 @@
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Date;
+import java.sql.ResultSet;
+import java.util.List;
+
+public class PartitionWorker implements Runnable {
+
+    private static final Logger log = LoggerFactory.getLogger(PartitionWorker.class);
+
+    private final int localIndex;
+    private final int assignedRemainder;
+    private final JdbcTemplate jdbcTemplate;
+    private final Date targetOperdate;
+    private final int batchSize;
+    private final int totalHashPartitions;
+
+    private volatile boolean running = true;
+
+    public PartitionWorker(int localIndex,
+                           int assignedRemainder,
+                           JdbcTemplate jdbcTemplate,
+                           Date targetOperdate,
+                           int batchSize,
+                           int totalHashPartitions) {
+        this.localIndex = localIndex;
+        this.assignedRemainder = assignedRemainder;
+        this.jdbcTemplate = jdbcTemplate;
+        this.targetOperdate = targetOperdate;
+        this.batchSize = batchSize;
+        this.totalHashPartitions = totalHashPartitions;
+    }
+
+    public void shutdown() {
+        running = false;
+    }
+
+    @Override
+    public void run() {
+        log.info("Worker-{} started, assigned to partition remainder {}", localIndex, assignedRemainder);
+
+        while (running && !Thread.currentThread().isInterrupted()) {
+            try {
+                List<Task> tasks = claimTasks();
+
+                if (tasks.isEmpty()) {
+                    Thread.sleep(500); // idle backoff
+                    continue;
+                }
+
+                for (Task task : tasks) {
+                    try {
+                        processAndComplete(task);
+                    } catch (Exception e) {
+                        log.error("Failed to process task id={}", task.id, e);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                log.error("Worker-{} loop error", localIndex, e);
+                try { Thread.sleep(1000); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        log.info("Worker-{} stopped", localIndex);
+    }
+
+    /**
+     * Transaction 1: claim a batch. Uses FOR UPDATE SKIP LOCKED so multiple
+     * threads on the same partition don't collide.
+     */
+    @Transactional
+    public List<Task> claimTasks() {
+        String sql = """
+            SELECT id, operdate, payload
+            FROM my_table
+            WHERE operdate = ?
+              AND id %% ? = ?
+              AND status = 'PENDING'
+            ORDER BY id
+            LIMIT ?
+            FOR UPDATE SKIP LOCKED
+            """;
+        // Note: %% escapes the % in Java text blocks for JDBC
+
+        return jdbcTemplate.query(sql,
+                (ResultSet rs, int rowNum) -> {
+                    Task t = new Task();
+                    t.id = rs.getLong("id");
+                    t.operdate = rs.getDate("operdate");
+                    t.payload = rs.getString("payload");
+                    return t;
+                },
+                targetOperdate, totalHashPartitions, assignedRemainder, batchSize);
+    }
+
+    /**
+     * Transaction 2: do work and mark complete.
+     * Status is NOT part of the PK index, so this is a HOT update (no index churn).
+     */
+    @Transactional
+    public void processAndComplete(Task task) {
+        // --- business logic here ---
+        doActualWork(task);
+
+        String sql = "UPDATE my_table SET status = 'COMPLETED', updated_at = NOW() " +
+                     "WHERE operdate = ? AND id = ?";
+        jdbcTemplate.update(sql, task.operdate, task.id);
+    }
+
+    private void doActualWork(Task task) {
+        // simulate work
+        try { Thread.sleep(5); } catch (InterruptedException ignored) {}
+    }
+
+    static class Task {
+        long id;
+        Date operdate;
+        String payload;
+    }
+}
