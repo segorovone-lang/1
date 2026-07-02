@@ -1,0 +1,44 @@
+import org.redisson.api.RAtomicLong;
+import org.redisson.api.RedissonClient;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Component
+public class DistributedThreadAssigner {
+
+    private final RedissonClient redisson;
+
+    @Value("${worker.threads-per-pod}")
+    private int threadsPerPod;
+
+    @Value("${worker.total-hash-partitions}")
+    private int totalHashPartitions;
+
+    private static final String COUNTER_KEY = "global_worker_thread_counter";
+
+    public DistributedThreadAssigner(RedissonClient redisson) {
+        this.redisson = redisson;
+    }
+
+    /**
+     * Atomically claims `threadsPerPod` thread IDs from a global counter,
+     * then maps each to a hash partition remainder via modulo.
+     * Safe across pod restarts — modulo keeps the mapping balanced.
+     */
+    public List<Integer> assignPartitionRemainders() {
+        RAtomicLong counter = redisson.getAtomicLong(COUNTER_KEY);
+        long newTotal = counter.addAndGet(threadsPerPod);
+        long baseId = newTotal - threadsPerPod;
+
+        List<Integer> remainders = new ArrayList<>(threadsPerPod);
+        for (int i = 0; i < threadsPerPod; i++) {
+            long globalThreadId = baseId + i;
+            int remainder = (int) (globalThreadId % totalHashPartitions);
+            remainders.add(remainder);
+        }
+        return remainders;
+    }
+}
