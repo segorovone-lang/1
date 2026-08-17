@@ -1,0 +1,87 @@
+import org.apache.kafka.clients.producer.Partitioner;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.utils.Utils;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class PriorityAwareStickyPartitioner implements Partitioner {
+
+    private static final int PRIORITY_1_PARTITION = 0;
+    private static final int PRIORITY_2_PARTITION = 1;
+    private static final int NORMAL_PARTITIONS_START = 2; // партиции 2..7 (6 штук)
+
+    // Для sticky-распределения: текущая партиция для каждого топика
+    private final Map<String, AtomicInteger> currentPartitionIndex = new ConcurrentHashMap<>();
+    // Время последнего переключения (можно заменить на количество сообщений)
+    private final Map<String, Long> lastSwitchTime = new ConcurrentHashMap<>();
+    private long switchIntervalMs = 10_000; // переключаемся каждые 10 сек
+
+    @Override
+    public void configure(Map<String, ?> configs) {
+        // можно вычитать интервал из конфигурации, если нужно
+    }
+
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes, Cluster cluster) {
+
+        // Проверяем заголовок priority (добавляется в ProducerRecord)
+        Integer priority = getPriorityFromHeaders(topic, value); // см. ниже
+        if (priority != null) {
+            if (priority == 1) return PRIORITY_1_PARTITION;
+            if (priority == 2) return PRIORITY_2_PARTITION;
+            throw new IllegalArgumentException("Unsupported priority: " + priority);
+        }
+
+        // Получаем список партиций 2..7
+        List<PartitionInfo> availablePartitions = cluster.availablePartitionsForTopic(topic);
+        List<Integer> normalPartitions = availablePartitions.stream()
+                .map(PartitionInfo::partition)
+                .filter(p -> p >= NORMAL_PARTITIONS_START)
+                .sorted()
+                .toList();
+
+        if (normalPartitions.isEmpty()) {
+            // fallback – если вдруг все 6 партиций недоступны
+            return 0;
+        }
+
+        // Если ключ задан – используем обычный хэш (для гарантии порядка одинаковых ключей)
+        if (keyBytes != null) {
+            int hash = Utils.toPositive(Utils.murmur2(keyBytes));
+            return normalPartitions.get(hash % normalPartitions.size());
+        }
+
+        // Sticky-распределение по normalPartitions
+        long now = System.currentTimeMillis();
+        AtomicInteger currentIdx = currentPartitionIndex.computeIfAbsent(topic, t -> new AtomicInteger(0));
+        Long lastSwitch = lastSwitchTime.get(topic);
+
+        if (lastSwitch == null || now - lastSwitch >= switchIntervalMs) {
+            // переключаемся на следующую партицию
+            int nextIdx = (currentIdx.get() + 1) % normalPartitions.size();
+            currentIdx.set(nextIdx);
+            lastSwitchTime.put(topic, now);
+        }
+
+        return normalPartitions.get(currentIdx.get());
+    }
+
+    private Integer getPriorityFromHeaders(String topic, Object value) {
+        // В реальном коде нужно получать заголовки из ProducerRecord, но partition() не имеет доступа к ним.
+        // Поэтому заголовки нужно передавать через value (если value содержит информацию о приоритете)
+        // или использовать ThreadLocal / отдельный механизм.
+        // Проще всего: перед отправкой класть заголовок в ThreadLocal или в саму запись.
+        // Ниже показан обходной путь через ThreadLocal.
+        return PriorityHeaderHolder.getPriority();
+    }
+
+    @Override
+    public void close() {}
+}
